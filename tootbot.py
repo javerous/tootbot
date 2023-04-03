@@ -1,4 +1,5 @@
 import os.path
+from pathlib import Path
 import sys
 import re
 import html
@@ -17,430 +18,522 @@ import requests
 
 from decimal import *
 
-MAX_VIDEO_SIZE_MB = 40
 
+
+############################################################################################
+# Configuration
+
+# Maximum video size.
+kMAX_VIDEO_SIZE_MB = 40
+
+# App name.
+kAPP_NAME = 'tootbot'
+
+
+
+############################################################################################
+# Helpers
+
+# Resolve redirected links.
 def unredir(redir):
-    r = requests.get(redir, allow_redirects=False)
+    r = requests.get(redir, allow_redirects = False)
+
     redir_count = 0
-    while r.status_code in {301, 302}:
+
+    while r.status_code in { 301, 302 }:
         redir_count = redir_count + 1
+
         if redir_count > 10:
             break
+
         if 'http' not in r.headers.get('Location'):
-            redir = re.sub(r'(https?://.*)/.*', r'\1', redir) + \
-                r.headers.get('Location')
+            redir = re.sub(r'(https?://.*)/.*', r'\1', redir) + r.headers.get('Location')
         else:
             redir = r.headers.get('Location')
-        print('redir', redir)
+
         if '//ow.ly/' in redir or '//bit.ly/' in redir:
             redir = redir.replace('https://ow.ly/', 'http://ow.ly/') # only http
-            redir = requests.get(redir, allow_redirects=False).headers.get('Location')
-            print('redir+', redir)
+            redir = requests.get(redir, allow_redirects = False).headers.get('Location')
+
         try:
-            r = requests.get(redir, allow_redirects=False, timeout=5)
+            r = requests.get(redir, allow_redirects = False, timeout = 5)
         except:
             redir = redir.replace('https://', 'http://')  # only http ?
-            r = requests.get(redir, allow_redirects=False)
+            r = requests.get(redir, allow_redirects = False)
+
     return redir
 
+# Remove a file and ignore errors.
+def unlink_path(file_path):
+    try:
+        file_path.unlink();
+    except:
+        pass
 
-if len(sys.argv) < 4:
-    print("Usage: python3 tootbot.py twitter_account mastodon_login mastodon_passwd mastodon_instance [max_days [footer_tags [delay]]]")  # noqa
+# Post a media to Mastodon.
+def mastodon_media_post(mastodon_api, data, mime_type, updater = None):
+
+    # Updater helper.
+    def lupdater(text):
+        if updater is not None:
+            updater(text)
+
+    # Prepate things.
+    try_count = 0
+
+    # Re-try loop.
+    while True:
+        try:
+            media_posted = mastodon_api.media_post(data, mime_type = mime_type)
+
+            return media_posted['id']
+                        
+        except MastodonBadGatewayError as e:
+            try_count = try_count + 1
+                    
+            if try_count >= 10:
+                raise
+            else:
+                lupdater('unable to send media, will retry in 10 seconds (' + str(e) + ')')
+                time.sleep(10)
+                        
+        except Exception as e:
+            raise
+        
+# Post a toot to mastodon.
+def mastodon_post(mastodon_api, tweet_content, photos_ids, videos_ids, updater = None):
+
+    # Updater helper.
+    def lupdater(text):
+        if updater is not None:
+            updater(text)
+
+    # Prepare things.
+    try_count = 0
+    medias_ids = photos_ids + videos_ids
+
+    # Wait a bit for media to be ready on server side.
+    if len(medias_ids) > 0:
+        time.sleep(5)
+
+    # Re-try loop.
+    while True:
+        try:
+            toot = mastodon_api.status_post(tweet_content,
+                                            in_reply_to_id = None,
+                                            media_ids = medias_ids,
+                                            sensitive = False,
+                                            visibility = 'unlisted',
+                                            spoiler_text = None)
+            
+            return toot
+        
+        except MastodonAPIError as e:
+            description = str(e).lower()
+            try_count = try_count + 1
+
+            # Specific error catching work only with English instances. Not sure why Mastodon localize that.
+            if '422' in description and 'Unprocessable Entity'.lower() in description and 'Try again in a moment'.lower() in description:
+                if try_count >= 10:
+                    raise Exception('Medias take too long to proceed')
+                else:
+                    lupdater('medias are still processing, will retry in 10 seconds (' + str(e) + ')')
+                    time.sleep(10)
+
+            elif '422' in description and 'Unprocessable Entity'.lower() in description and 'Cannot attach a video to a post that already contains images'.lower() in description:
+                if try_count >= 2:
+                    raise Exception('Unexpected mixed images and videos')
+                else:
+                    lupdater('mixed images and videos, will retry in 5 seconds with only videos (' + str(e) + ')')
+                    medias_ids = videos_ids
+                    time.sleep(5)
+                    
+            else:
+                if try_count >= 5:
+                    raise Exception('Got an unknown API error - ' + str(e))
+                else:
+                    lupdater('got an unknown API error, will retry in 10 seconds (' + str(e) + ')')
+                    time.sleep(10)
+
+        except Exception as e:
+            raise
+
+# Download and recompress a video.
+def download_video(video_url, video_path, max_video_size_mb, updater = None):
+
+    # Updater helper.
+    def lupdater(text):
+        if updater is not None:
+            updater(text)
+    
+    # Remove file, in case the directory is dirty.
+    unlink_path(video_path)
+
+    # Download video.
+    lupdater("downloading the video")
+
+    try:
+        subprocess.run("yt-dlp -o '%s' -N 8 -f b -S 'filesize~%sM' --recode-video mp4 --no-playlist --max-filesize 500M '%s'" %
+                        (str(video_path), str(max_video_size_mb), video_url), shell = True, capture_output = False, check = True)
+    except Exception as e:
+        unlink_path(video_path)
+        raise
+    
+    lupdater("video downloaded")
+
+    # Recompress
+    try:
+        tmp_video_path = video_path.with_name('tmp-' + video_path.name)
+        pass_video_path_prefix = video_path.with_name(video_path.name + '-ffmpeg2pass')
+
+        size = os.lstat(video_path).st_size
+                    
+        if size > max_video_size_mb * 1024 * 1024:
+            lupdater('video too big (%s > %s), recompressing' % (size, max_video_size_mb * 1024 * 1024))
+            
+            # > Compute the needed bitrate.
+            duration_result = subprocess.run("ffprobe -v error -show_entries format=duration -of csv=p=0 '%s'"
+                                             % (str(video_path)),
+                                             shell = True, capture_output = True, text = True, check = True)
+            
+            audio_bitrate_result = subprocess.run("ffprobe -v error -select_streams a:0 -show_entries stream=bit_rate -of csv=p=0 '%s'"
+                                                  % (str(video_path)),
+                                                  shell = True, capture_output=True, text = True, check = True)
+
+            duration_dec = Decimal(duration_result.stdout)
+            audio_bitrate_dec = Decimal(audio_bitrate_result.stdout)
+                        
+            if audio_bitrate_dec > Decimal(128000):
+                audio_bitrate_dec = Decimal(128000)
+                        
+            target_audio_bitrate_kbit_s = audio_bitrate_dec / Decimal(1000.0)
+            target_video_bitrate_kbit_s = (Decimal(max_video_size_mb) * Decimal(8192.0)) / (Decimal(1.048576) * duration_dec) - target_audio_bitrate_kbit_s
+                        
+            if target_video_bitrate_kbit_s <= Decimal(0):
+                raise Exception('result in negative bitrate ', target_video_bitrate_kbit_s)
+
+            # > Remove previous pass files, in case the directory is dirty.
+            for path in pass_video_path_prefix.parent.glob(pass_video_path_prefix.name + '*'):
+                unlink_path(path)
+
+            # > Encode the video in 2 passes, for better size accuracy.
+            subprocess.run("ffmpeg -y -i '%s' -c:v libx264 -b:v %sk -pass 1 -an -f mp4 -passlogfile '%s' -loglevel error -stats /dev/null" %
+                           (str(video_path), str(target_video_bitrate_kbit_s), str(pass_video_path_prefix)),
+                           shell = True, capture_output = False, check = True)
+            
+            subprocess.run("ffmpeg -y -i '%s' -c:v libx264 -b:v %sk -pass 2 -c:a aac -b:a %sk -passlogfile '%s' -loglevel error -stats '%s'"
+                           % (str(video_path), str(target_video_bitrate_kbit_s), str(target_audio_bitrate_kbit_s), str(pass_video_path_prefix), str(tmp_video_path)),
+                           shell = True, capture_output = False, check = True)
+            
+            # Move files.
+            video_path.unlink()
+            tmp_video_path.rename(video_path)
+
+    except Exception as e:
+            lupdater("unable to recompress video (" + str(e) + ")")
+
+    finally:
+        # > Remove pass files, in case the directory is dirty.
+        for path in pass_video_path_prefix.parent.glob(pass_video_path_prefix.name + '*'):
+            unlink_path(path)
+        
+        # > Remove temp file.
+        unlink_path(tmp_video_path)
+
+
+
+############################################################################################
+# Main
+
+root_path = Path()
+
+# Check arguments.
+if len(sys.argv) < 5:
+    print("Usage: python3 tootbot.py twitter_account mastodon_login mastodon_passwd mastodon_instance [max_days [footer_tags [delay]]]")
     sys.exit(1)
 
-if len(sys.argv) > 4:
-    instance = sys.argv[4]
-else:
-    instance = 'amicale.net'
+# Extract arguments.
+twitter_account = sys.argv[1]
+mastodon_login = sys.argv[2]
+mastodon_passwd = sys.argv[3]
+mastodon_instance = sys.argv[4]
 
 if len(sys.argv) > 5:
-    days = int(sys.argv[5])
+    max_days = int(sys.argv[5])
 else:
-    days = 1
+    max_days = 1
 
 if len(sys.argv) > 6:
-    tags = sys.argv[6]
+    footer_tags = sys.argv[6]
 else:
-    tags = None
+    footer_tags = None
 
 if len(sys.argv) > 7:
     delay = int(sys.argv[7])
 else:
     delay = 0
 
-source = sys.argv[1]
-mastodon = sys.argv[2]
-passwd = sys.argv[3]
+# Forge log prefix.
+log_prefix = twitter_account + ':'
 
-if 'http' not in source:
-    # switch to local account directory
+# Create directory for Twitter account.
+account_path = root_path.joinpath(twitter_account)
+
+if account_path.exists():
+    if not account_path.is_dir():
+        print(log_prefix, 'Cannot create directory "' + str(account_path) + '" because a file with this name altready exists.')
+        sys.exit(1)
+else:
     try:
-        os.mkdir(source)
-    except:
-        pass
-    os.chdir(source)
-
-    # copy (old) global sqlite database to local account directory
-    if not os.path.exists('tootbot.db'):
-        shutil.copy('../tootbot.db', 'tootbot.db')
-
-sql = sqlite3.connect('tootbot.db')
-db = sql.cursor()
-db.execute('''CREATE TABLE IF NOT EXISTS tweets (tweet text, toot text,
-           twitter text, mastodon text, instance text)''')
-
-
-# Create application if it does not exist
-if not os.path.isfile(instance+'.secret'):
-    if Mastodon.create_app(
-        'tootbot',
-        api_base_url='https://'+instance,
-        to_file=instance+'.secret'
-    ):
-        print('tootbot app created on instance '+instance)
-    else:
-        print('failed to create app on instance '+instance)
+        os.mkdir(twitter_account)
+    except Exception as e:
+        print(log_prefix, 'Cannot create directory "'+ str(account_path) + '":', e)
         sys.exit(1)
 
+
+# Open database.
+sql_path = account_path.joinpath('tootbot.db')
+
 try:
-    mastodon_api = Mastodon(
-        client_id=instance+'.secret',
-        api_base_url='https://'+instance
-    )
+    sql = sqlite3.connect(sql_path)
+    db = sql.cursor()
+    db.execute('''CREATE TABLE IF NOT EXISTS tweets (tweet text, toot text, twitter text, mastodon text, instance text)''')
+except Exception as e:
+    print(log_prefix, 'Cannot create database file "' + str(sql_path) + '":', e)
+    sys.exit(1)
+
+# Create application if it does not exist.
+mastodon_secret_path = account_path.joinpath(mastodon_instance + '.secret')
+mastodon_base_url = 'https://' + mastodon_instance
+
+if not mastodon_secret_path.exists():
+    if Mastodon.create_app(kAPP_NAME, api_base_url = mastodon_base_url, to_file = mastodon_secret_path):
+        print(log_prefix, 'Tootbot app created on instance "' + mastodon_instance + '".')
+    else:
+        print(log_prefix, 'Failed to create app on instance "' + mastodon_instance + '".')
+        sys.exit(1)
+
+
+# Login to Mastodon.
+print(log_prefix, 'Login to Mastodon "' + mastodon_login + '".')
+
+login_secret_path = account_path.joinpath(mastodon_login + '.secret')
+
+try:
+    mastodon_api = Mastodon(client_id = mastodon_secret_path, api_base_url = mastodon_base_url)
+
     mastodon_api.log_in(
-        username=mastodon,
-        password=passwd,
-        scopes=['read', 'write'],
-        to_file=mastodon+".secret"
+        username = mastodon_login,
+        password = mastodon_passwd,
+        scopes = ['read', 'write'],
+        to_file = login_secret_path
     )
-except:
-    print("ERROR: First Login Failed!")
+except Exception as e:
+    print(log_prefix, 'Login failed -', e)
+    sys.exit(1)
+
+# Remove previous fetched tweets.
+for path in account_path.glob('tweets.*json'):
+    unlink_path(path)
+
+
+# Fetch tweets.
+print(log_prefix, 'Fetching tweets.')
+      
+twitter_sjson_path = account_path.joinpath('tweets.sjson')
+twitter_json_path = account_path.joinpath('tweets.json')
+
+try:
+    subprocess.run("twint -u '%s' -tl --full-text --limit 10 --json -o '%s'" % (twitter_account, str(twitter_sjson_path),), shell = True, capture_output = True, check = True)
+    subprocess.run("jq -s . '%s' > '%s'" % (str(twitter_sjson_path), str(twitter_json_path),), shell = True, capture_output = True, check = True)
+except Exception as e:
+    print(log_prefix, 'Failed to fetch tweets -', e)
     sys.exit(1)
 
 
-print(source)
-print("---------------------------")
+# Load JSON.
+try:
+    tweets = json.load(open(twitter_json_path, 'r'))
+except Exception as e:
+    print(log_prefix, 'Failed to parse tweets -', e)
+    sys.exit(1)
 
-if source[:4] == 'http':
-    d = feedparser.parse(source)
-    twitter = None
-    print(len(d.entries))
-    for t in reversed(d.entries):
-        # check if this tweet has been processed
-        if id in t:
-            id = t.id
-        else:
-            id = t.title
-        db.execute('SELECT * FROM tweets WHERE tweet = ? AND twitter = ?  and mastodon = ? and instance = ?', (id, source, mastodon, instance))  # noqa
-        last = db.fetchone()
-        dt = t.published_parsed
-        age = datetime.now()-datetime(dt.tm_year, dt.tm_mon, dt.tm_mday,
-                                    dt.tm_hour, dt.tm_min, dt.tm_sec)
-        # process only unprocessed tweets less than 1 day old, after delay
-        if last is None and age < timedelta(days=days) and age > timedelta(days=delay):
-            c = t.title
-            if twitter and t.author.lower() != ('(@%s)' % twitter).lower():
-                c = ("RT https://twitter.com/%s\n" % t.author[2:-1]) + c
-            toot_media = []
-            # get the pictures...
+print(log_prefix, 'Fetched', len(tweets), 'tweets.')
 
-            if 'summary' in t:
-                for p in re.finditer(r"https://pbs.twimg.com/[^ \xa0\"]*", t.summary):
-                    media = requests.get(p.group(0))
-                    media_posted = mastodon_api.media_post(
-                        media.content, mime_type=media.headers.get('content-type'))
-                    toot_media.append(media_posted['id'])
-                for p in re.finditer(r"https://imgs.xkcd.com/[^ \"]*", t.summary):
-                    print(p.group(0))
-                    media = requests.get(p.group(0))
-                    media_posted = mastodon_api.media_post(
-                        media.content, mime_type=media.headers.get('content-type'))
-                    toot_media.append(media_posted['id'])
+for tweet in reversed(tweets):
+    tweet_content_raw =  tweet['tweet']
+    tweet_content = html.unescape(tweet_content_raw)
+    tweet_id = tweet['id']
+    tweet_username = tweet['username']
+    tweet_photos_url = []
 
-                for p in re.finditer(r"https://i.redd.it/[a-zA-Z0-9]*.(gif/jpg/mp4/png|webp)", t.summary):
-                    mediaUrl = p.group(0)
-                    try:
-                        media = requests.get(mediaUrl)
-                        media_posted = mastodon_api.media_post(
-                            media.content, mime_type=media.headers.get('content-type'))
-                        toot_media.append(media_posted['id'])
-                    except:
-                        print('Could not upload media to Mastodon! ' + mediaUrl)
+    toot_photos_ids = []
+    toot_videos_ids = []
 
-            if 'links' in t:
-                for l in t.links:
-                    if l.type in ('image/gif', 'image/jpg', 'image/png', 'image/webp'):
-                        media = requests.get(l.url)
-                        media_posted = mastodon_api.media_post(
-                            media.content, mime_type=media.headers.get('content-type'))
-                        toot_media.append(media_posted['id'])
+    # Define log helper.
+    def log_updater(text):
+        print(log_prefix, text.capitalize() + '.')
 
-            # replace short links by original URL
-            m = re.search(r"http[^ \xa0]*", c)
-            if m is not None:
-                l = m.group(0)
-                try:
-                    redir = unredir(l)
-                    c = c.replace(l, redir)
-                except:
-                    print('Cannot resolve link redirect: ' + l)
+    # Do not toot twitter replies.
+    if 'reply_to' in tweet and len(tweet['reply_to'])>0:
+        print(log_prefix, 'Reply - "' + tweet_content.replace('\n', ' ') + '".')
+        continue
+    
+    # Do not toot twitter quoted RT. XXX Perhaps reconsider that.
+    if 'quote_url' in tweet and tweet['quote_url'] != '':
+        print(log_prefix, 'Quoted - "' + tweet_content.replace('\n', ' ') + '".')
+        continue
 
-            # remove ellipsis
-            c = c.replace('\xa0…', ' ')
+    # Skip invalid content.
+    if tweet_content[-1] == "…":
+        continue
 
-            if 'authors' in t:
-                c = c + '\nSource: ' + t.authors[0].name
-            c = c + '\n\n' + t.link
-
-            # replace links to reddit by libreddit ones
-            c = c.replace('old.reddit.com', 'libreddit.net')
-            c = c.replace('reddit.com', 'libreddit.net')
-
-            if tags:
-                c = c + '\n' + tags
-
-            if toot_media is not None:
-                toot = mastodon_api.status_post(c,
-                                                in_reply_to_id=None,
-                                                media_ids=toot_media,
-                                                sensitive=False,
-                                                visibility='public',
-                                                spoiler_text=None)
-                if "id" in toot:
-                    db.execute("INSERT INTO tweets VALUES ( ? , ? , ? , ? , ? )",
-                            (id, toot["id"], source, mastodon, instance))
-                    sql.commit()
-
-else:
-    # cleanup local database after migration from the global one
-    db.execute("DELETE FROM tweets WHERE twitter != ?", (source,))
-    sql.commit()
-    db.execute("VACUUM")
-
-    subprocess.run('rm -f tweets.*json; twint -u %s -tl --limit 10 --json -o tweets.sjson; jq -s . tweets.sjson > tweets.json' %
-                   (source,), shell=True, capture_output=True)
-    d = json.load(open('tweets.json','r'))
-    twitter = source
-
-    print(len(d))
-    for t in reversed(d):
-        c = html.unescape(t['tweet'])
-        # do not toot twitter replies
-        if 'reply_to' in t and len(t['reply_to'])>0:
-            print('Reply:',c)
-            continue
-        # do not toot twitter quoted RT
-        if 'quote_url' in t and t['quote_url'] != '':
-            print('Quoted:', c)
-            continue
-
-        # check if this tweet has been processed
-        id = t['id']
-        db.execute('SELECT * FROM tweets WHERE tweet = ? AND twitter = ?  and mastodon = ? and instance = ?', (id, source, mastodon, instance))  # noqa
+    # Check if this tweet has been processed
+    try:
+        db.execute('SELECT * FROM tweets WHERE tweet = ? AND twitter = ? and mastodon = ? and instance = ?', (tweet_id, twitter_account, mastodon_login, mastodon_instance))  # noqa
         last = db.fetchone()
 
-        # process only unprocessed tweets
         if last:
             continue
+    except Exception as e:
+        print(log_prefix, 'Cannot check if tweet', tweet_id, 'exist in database -', e)
+        continue
 
-        if c[-1] == "…":
-            continue
+    print('Tweet - "' + tweet_content.replace('\n', ' ') + '"')
 
-        toot_media = []
-        toot_media_videos = []
+    # Handle retweet.
+    if twitter_account and tweet_username.lower() != twitter_account.lower():
+        tweet_content = ("RT https://twitter.com/%s\n" % tweet_username) + tweet_content
 
-        if twitter and t['username'].lower() != twitter.lower():
-            c = ("RT https://twitter.com/%s\n" % t['username']) + c
-            # get the pictures...
-            for p in re.finditer(r"https://pbs.twimg.com/[^ \xa0\"]*", t['tweet']):
-                media = requests.get(p.group(0))
-                media_posted = mastodon_api.media_post(
-                    media.content, mime_type=media.headers.get('content-type'))
-                toot_media.append(media_posted['id'])
+        # > Extract photo URLs. XXX not sure why, they are not part of `tweet['photos']` in such case ?
+        for photo in re.finditer(r"https://pbs.twimg.com/[^ \xa0\"]*", tweet_content_raw):
+            photo_url = photo.group(0)
+            tweet_photos_url.append(photo_url)
 
-        if 'photos' in t:
-            for url in t['photos']:
-                print(source, ': download photo -', url)
-                try:
-                    media = requests.get(url.replace(
-                            'https://pbs.twimg.com/', 'https://nitter.net/pic/orig/'))
-                    print(source, ': downloaded nitter', media.headers.get('content-type'))
-                    media_posted = mastodon_api.media_post(
-                        media.content, mime_type=media.headers.get('content-type'))
-                    print(source, ': posted nitter')
-                    toot_media.append(media_posted['id'])
-                except:
-                    media = requests.get(url)
-                    print(source, ':downloaded twitter photo', media.headers.get('content-type'))
-                    media_posted = mastodon_api.media_post(
-                        media.content, mime_type=media.headers.get('content-type'))
-                    print(source, ': posted twitter photo')
-                    toot_media.append(media_posted['id'])
+    # Handle photos.
+    if 'photos' in tweet:
+        tweet_photos_url = tweet_photos_url + tweet['photos']
 
+    for photo_url in tweet['photos']:
+        media = None
 
-        # replace short links by original URL
-        links = re.findall(r"http[^ \xa0]*", c)
-        for l in links:
-            redir = unredir(l)
-            m = re.search(r'twitter.com/.*/photo/', redir)
-            if m is None:
-                c = c.replace(l, redir)
-            else:
-                c = c.replace(l, '')
+        print(log_prefix, 'Download photo "' + photo_url + '".')
 
-            m = re.search(r'(twitter.com/.*/video/)', redir)
-            if m is None:
-                c = c.replace(l, redir)
-            else:
-                print(source, ': link - ',l)
-                c = c.replace(l, '')
-                video = redir
-                
-                print(source, ': download video - ', video)
-                subprocess.run("rm -f out.mp4; yt-dlp -o out.mp4 -N 8 -f b -S 'filesize~%sM' --recode-video mp4 --no-playlist --max-filesize 500M '%s'" %
-                            (str(MAX_VIDEO_SIZE_MB), video,), shell=True, capture_output=False)
-                print(source, ': downloaded video')
-                
-                # recompress
-                try:
-                    size = os.lstat("out.mp4").st_size
-                    
-                    if size > MAX_VIDEO_SIZE_MB * 1024 * 1024:
-                        print("video too big (%s > %s) - recompress" % (size, MAX_VIDEO_SIZE_MB * 1024 * 1024))
-                        
-                        duration_result = subprocess.run('ffprobe -v error -show_entries format=duration -of csv=p=0 out.mp4', shell=True, capture_output=True, text=True)
-                        audio_bitrate_result = subprocess.run('ffprobe -v error -select_streams a:0 -show_entries stream=bit_rate -of csv=p=0 out.mp4', shell=True, capture_output=True, text=True)
-
-                        duration_dec = Decimal(duration_result.stdout)
-                        audio_bitrate_dec = Decimal(audio_bitrate_result.stdout)
-                        
-                        if audio_bitrate_dec > Decimal(128000):
-                            audio_bitrate_dec = Decimal(128000)
-                        
-                        target_audio_bitrate_kbit_s = audio_bitrate_dec / Decimal(1000.0)
-                        target_video_bitrate_kbit_s = (Decimal(MAX_VIDEO_SIZE_MB) * Decimal(8192.0)) / (Decimal(1.048576) * duration_dec) - target_audio_bitrate_kbit_s
-                        
-                        if target_video_bitrate_kbit_s <= Decimal(0):
-                            raise Exception('result in negative bitrate ', target_video_bitrate_kbit_s)
-                        
-                        subprocess.run('rm -f ffmpeg2pass*', shell=True, capture_output=False)
-                        subprocess.run('ffmpeg -y -i out.mp4 -c:v libx264 -b:v %sk -pass 1 -an -f mp4 -loglevel error -stats /dev/null' % (str(target_video_bitrate_kbit_s),), shell=True, capture_output=False)
-                        subprocess.run('ffmpeg -y -i out.mp4 -c:v libx264 -b:v %sk -pass 2 -c:a aac -b:a %sk -loglevel error -stats out_enc.mp4' % (str(target_video_bitrate_kbit_s),str(target_audio_bitrate_kbit_s),), shell=True, capture_output=False)
-                        subprocess.run('rm -f ffmpeg2pass*', shell=True, capture_output=False)
-
-                        os.remove('out.mp4')
-                        os.rename('out_enc.mp4', 'out.mp4')
-                except Exception as e:
-                    print(source, ': unable to recompress video', e)
-                
-                # post
-                retry_video = 0
-                
-                while True:
-                    try:
-                        file = open("out.mp4", "rb")
-                        video_data = file.read()
-                        file.close()
-                        
-                        media_posted = mastodon_api.media_post(video_data, mime_type='video/mp4')
-                        c = c.replace(video, '')
-                        
-                        print(source, ': posted video')
-                        
-                        toot_media.append(media_posted['id'])
-                        toot_media_videos.append(media_posted['id'])
-                        
-                        break
-                        
-                    except MastodonBadGatewayError as e:
-                        retry_video = retry_video + 1
-                    
-                        if retry_video >= 6:
-                            print(source, ': unable to send video - skip this video', e)
-                            break
-                        else:
-                            print(source, ': unable to send video - retry in 10 seconds', e)
-                            time.sleep(10)
-                        
-                    except Exception as e:
-                        print(source, ': unable to send video', e)
-                        break
-
-        # remove pic.twitter.com links
-        m = re.search(r"pic.twitter.com[^ \xa0]*", c)
-        if m is not None:
-            l = m.group(0)
-            c = c.replace(l, ' ')
-
-        # remove ellipsis
-        c = c.replace('\xa0…', ' ')
-
-        #c = c.replace('  ', '\n').replace('. ', '.\n')
-
-        # replace links to twitter by nitter ones
-        c = c.replace('/twitter.com/', '/nitter.net/')
-
-        # replace utm_? tracking
-        c = re.sub('\?utm.*$', '?utm_medium=Social&utm_source=Mastodon', c)
-
-        if tags:
-            c = c + '\n' + tags
-
-        # post
-        retry_post = 0
-        
-        if len(toot_media)>0:
-            time.sleep(5)
-
-        while True:
+        # > Try by passing by nitter.
+        if media is None:
             try:
-                toot = mastodon_api.status_post(c,
-                                                in_reply_to_id=None,
-                                                media_ids=toot_media,
-                                                sensitive=False,
-                                                visibility='unlisted',
-                                                spoiler_text=None)
+                media = requests.get(photo_url.replace('https://pbs.twimg.com/', 'https://nitter.net/pic/orig/'))
+            except Exception as e:
+                print(log_prefix, 'Failed to download the photo via nitter -', e)
 
-                if "id" in toot:
-                    db.execute("INSERT INTO tweets VALUES ( ? , ? , ? , ? , ? )", (id, toot["id"], source, mastodon, instance))
-                    sql.commit()
-                    print(source, ": tweet created at",t['created_at'])
+        # > Try by using the original link.
+        if media is None:
+            try:
+                media = requests.get(photo_url)
+            except Exception as e:
+                print(log_prefix, 'Failed to download the photo via original url -', e)
 
-                break
+        # > Post.
+        if media is not None:
+            try:
+                print(log_prefix, 'Upload photo to Mastodon server.')
 
-            except MastodonAPIError as e:
-                description = str(e).lower()
-                retry_post = retry_post + 1
+                media_id = mastodon_media_post(mastodon_api, media.content, media.headers.get('content-type'), log_updater)
 
-                # Specific error catching work only with English instances. Not sure why Mastodon localize that.
-                if '422' in description and 'Unprocessable Entity'.lower() in description and 'Try again in a moment'.lower() in description:
-                    if retry_post >= 10:
-                        print(source, ': medias take too long to proceed - skip this tweet', e)
-                        break
-                    else:
-                        print(source, ': medias are still processing - retry in 10 seconds', e)
-                        time.sleep(10)
+                toot_photos_ids.append(media_id)
 
-                elif '422' in description and 'Unprocessable Entity'.lower() in description and 'Cannot attach a video to a post that already contains images'.lower() in description:
-                    if retry_post >= 2:
-                        print(source, ': unexpected mixed images and videos - skip this tweet', e)
-                        break
-                    else:
-                        print(source, ': mixed images and videos - retry in 5 seconds with only videos', e)
-                        toot_media = toot_media_videos
-                        time.sleep(5)
-                
-                else:
-                    if retry_post >= 5:
-                        print(source, ': got an unknown API error again - skip this tweet', e)
-                        break
-                    else:
-                        print(source, ': got an unknown API error - retry in 10 seconds', e)
-                        time.sleep(10)
+                print(log_prefix, 'Uploaded photo (' + str(media_id) + ').')
+            except Exception as e:
+                print(log_prefix, 'Cannot upload photo -', e)
+
+    
+    # Handle inline links.
+    links = re.findall(r"http[^ \xa0]*", tweet_content)
+    
+    for link in links:
+        dir_link = unredir(link)
+        link_handled = False
+
+        # > Photo link: remove (they have been handled and attached in previous section).
+        m = re.search(r'twitter.com/.*/photo/', dir_link)
+
+        if m is not None:
+            tweet_content = tweet_content.replace(link, '')
+            link_handled = True
+
+        # > Pic link: remove (they have been handled and attached in previous section).
+        m = re.search(r"pic.twitter.com", link)
+
+        if m is not None:
+            tweet_content = tweet_content.replace(link, ' ')
+            link_handled = True
+
+        # > Video link: download, post, and remove the link.
+        m = re.search(r'(twitter.com/.*/video/)', dir_link)
+        
+        if m is not None:
+            video_path = account_path.joinpath('video.mp4')
+
+            print(log_prefix, 'Download video "' + dir_link +  '".')
+
+            try:
+                # > Download the video.
+                download_video(dir_link, video_path, kMAX_VIDEO_SIZE_MB, log_updater)
+
+                # > Read video content.
+                file = open(video_path, "rb")
+                video_data = file.read()
+                file.close()
+
+                # > Post the video.
+                print(log_prefix, 'Upload video to Mastodon server.')
+
+                media_id = mastodon_media_post(mastodon_api, video_data, 'video/mp4', log_updater)
+
+                print(log_prefix, 'Uploaded video (' + str(media_id) + ').')
+
+                # > Store media id.
+                toot_videos_ids.append(media_id)
+
+                # > Remove the link.
+                tweet_content = tweet_content.replace(link, '')
+                link_handled = True
 
             except Exception as e:
-                print(source, ': got an unknown error - skip this tweet',  e)
-                break
+                print(log_prefix, 'Cannot upload video -', e)
 
-print('---------------------------')
-print()
+
+        # > Link not handled: replace with direct link.
+        if link_handled == False:
+            tweet_content = tweet_content.replace(link, dir_link)
+
+    # Remove ellipsis
+    tweet_content = tweet_content.replace('\xa0…', ' ')
+
+    #c = c.replace('  ', '\n').replace('. ', '.\n')
+
+    # Replace links to twitter by nitter ones.
+    tweet_content = tweet_content.replace('/twitter.com/', '/nitter.net/')
+
+    # Replace utm_? tracking.
+    tweet_content = re.sub('\?utm.*$', '?utm_medium=Social&utm_source=Mastodon', tweet_content)
+
+    if footer_tags:
+        tweet_content = tweet_content + '\n' + footer_tags
+    
+    # Post.
+    print(log_prefix, 'Posting toot.')
+
+    try:
+        # > Post the toot.
+        toot = mastodon_post(mastodon_api, tweet_content, toot_photos_ids, toot_videos_ids, log_updater)
+
+        # > Save in database.
+        db.execute("INSERT INTO tweets VALUES ( ? , ? , ? , ? , ? )", (tweet_id, toot["id"], twitter_account, mastodon_login, mastodon_instance))
+        sql.commit()
+        
+        # > Log post.
+        print(log_prefix, 'Tweet created at', tweet['created_at'], "posted.")
+
+    except Exception as e:
+        print(log_prefix, e, '- skip tweet.')
