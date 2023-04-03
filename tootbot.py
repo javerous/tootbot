@@ -508,7 +508,7 @@ for tweet in reversed(tweets):
             tweet_content = tweet_content.replace(link, dir_link)
 
     # Remove ellipsis
-    tweet_content = tweet_content.replace('\xa0…', ' ')
+    #tweet_content = tweet_content.replace('\xa0…', ' ')
 
     #c = c.replace('  ', '\n').replace('. ', '.\n')
 
