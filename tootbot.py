@@ -21,6 +21,19 @@ import requests
 from decimal import *
 
 
+'''
+Note:
+- https://github.com/twintproject/twint (Twint) have been archived for some obscure reason.
+- https://github.com/twintproject/twint-zero (Twint-Zero) Seems that the designated successor.
+
+It will probably require to switch to it at some point.
+
+It has some advantages (simple interface, direct JSON output on stdout, etc.), but is too limited for
+  now to use it as a replacement (some links are missing, like videos one, there is no conversation_id, no quote URL...)
+
+Let stay on Twint for now.
+'''
+
 
 ############################################################################################
 # Configuration
@@ -38,30 +51,31 @@ kAPP_NAME = 'tootbot'
 
 # Resolve redirected links.
 def unredir(redir):
-    r = requests.get(redir, allow_redirects = False)
 
     redir_count = 0
 
-    while r.status_code in { 301, 302 }:
+    while True:
+        try:
+            r = requests.head(redir, allow_redirects = False, timeout = 15)
+            
+            status_code = r.status_code
+            location = r.headers.get('Location')
+                
+        except:
+            return redir
+
+        if status_code not in { 301, 302 }:
+            break
+        
         redir_count = redir_count + 1
 
         if redir_count > 10:
             break
 
-        if 'http' not in r.headers.get('Location'):
-            redir = re.sub(r'(https?://.*)/.*', r'\1', redir) + r.headers.get('Location')
+        if 'http' not in location:
+            redir = re.sub(r'(https?://.*)/.*', r'\1', redir) + location
         else:
-            redir = r.headers.get('Location')
-
-        if '//ow.ly/' in redir or '//bit.ly/' in redir:
-            redir = redir.replace('https://ow.ly/', 'http://ow.ly/') # only http
-            redir = requests.get(redir, allow_redirects = False).headers.get('Location')
-
-        try:
-            r = requests.get(redir, allow_redirects = False, timeout = 5)
-        except:
-            redir = redir.replace('https://', 'http://')  # only http ?
-            r = requests.get(redir, allow_redirects = False)
+            redir = location
 
     return redir
 
@@ -378,7 +392,7 @@ for path in account_path.glob('tweets.*json'):
 
 # Fetch tweets.
 print(log_prefix, 'Fetching tweets.')
-      
+
 twitter_sjson_path = account_path.joinpath('tweets.sjson')
 twitter_json_path = account_path.joinpath('tweets.json')
 
@@ -405,7 +419,6 @@ for tweet in reversed(tweets):
     tweet_username = tweet['username']
     tweet_content_raw =  tweet['tweet']
     tweet_content = html.unescape(tweet_content_raw)
-    tweet_photos_url = []
 
     toot_photos_ids = []
     toot_videos_ids = []
@@ -443,78 +456,49 @@ for tweet in reversed(tweets):
 
     # Handle retweet.
     if twitter_account and tweet_username.lower() != twitter_account.lower():
-        tweet_content = ("RT https://twitter.com/%s\n" % tweet_username) + tweet_content
+        tweet_content = ('RT https://twitter.com/%s\n' % tweet_username) + tweet_content
 
-        # > Extract photo URLs. XXX not sure why, they are not part of `tweet['photos']` in such case ?
-        for photo in re.finditer(r"https://pbs.twimg.com/[^ \xa0\"]*", tweet_content_raw):
-            photo_url = photo.group(0)
-            tweet_photos_url.append(photo_url)
-
-    # Handle photos.
-    if 'photos' in tweet:
-        tweet_photos_url = tweet_photos_url + tweet['photos']
-
-    for photo_url in tweet['photos']:
-        media = None
-
-        print(log_prefix, 'Download photo "' + photo_url + '".')
-
-        # > Try by passing by nitter.
-        if media is None:
-            try:
-                media = requests.get(photo_url.replace('https://pbs.twimg.com/', 'https://nitter.net/pic/orig/'))
-            except Exception as e:
-                print(log_prefix, 'Failed to download the photo via nitter -', e)
-
-        # > Try by using the original link.
-        if media is None:
-            try:
-                media = requests.get(photo_url)
-            except Exception as e:
-                print(log_prefix, 'Failed to download the photo via original url -', e)
-
-        # > Post.
-        if media is not None:
-            try:
-                print(log_prefix, 'Upload photo to Mastodon server.')
-
-                media_id = mastodon_media_post(mastodon_api, media.content, media.headers.get('content-type'), log_updater)
-
-                toot_photos_ids.append(media_id)
-
-                print(log_prefix, 'Uploaded photo (' + str(media_id) + ').')
-            except Exception as e:
-                print(log_prefix, 'Cannot upload photo -', e)
-
-    
-    # Handle inline links.
+    # Extract links.
     links = re.findall(r"http[^ \xa0]*", tweet_content)
     
+    if 'photos' in tweet:
+        links = links + tweet['photos']
+
+    # Handle links.
+    handled_links = set()
+    photos_enabled = True
+
     for link in links:
+
+        # > Resolve link.
         dir_link = unredir(link)
-        link_handled = False
 
-        # > Photo link: remove (they have been handled and attached in previous section).
-        m = re.search(r'twitter.com/.*/photo/', dir_link)
-
-        if m is not None:
-            tweet_content = tweet_content.replace(link, '')
-            link_handled = True
-
-        # > Pic link: remove (they have been handled and attached in previous section).
-        m = re.search(r"pic.twitter.com", link)
-
-        if m is not None:
-            tweet_content = tweet_content.replace(link, ' ')
-            link_handled = True
-
-        # > Video link: download, post, and remove the link.
-        m = re.search(r'(twitter.com/.*/video/)', dir_link)
+        # > Check it wasn't already handled.
+        if dir_link in handled_links:
+            continue
         
-        if m is not None:
+        handled_links.add(dir_link)
+
+        # > Log.
+        print(log_prefix, 'Handle link "' + link + '" -> "' + dir_link + '".')
+
+        # > Handle '/photo/' and '/video/' link as video.
+        # > The gif animations are encoded as video, and stay under the '/photo/' path. If it's a real photo, it will just fail.
+        is_photo_link = (re.search(r'twitter.com/.*/photo/', dir_link) is not None)
+        is_video_link = (re.search(r'twitter.com/.*/video/', dir_link) is not None)
+
+        if is_photo_link or is_video_link:
             video_path = account_path.joinpath('video.mp4')
 
             print(log_prefix, 'Download video "' + dir_link +  '".')
+
+            # > We consider that photos are in `tweet['photos']` with real link (different than this one), and so can be removed
+            # >   from the the tweet content in all cases (succes or error).
+            # > If we fail to upload the photo on next stage, the photo will be lost, but it's better than keeping the photo
+            # >   *and* the link to it.
+            if is_photo_link:
+                tweet_content = tweet_content.replace(link, '')
+                tweet_content = tweet_content.replace(dir_link, '')
 
             try:
                 # > Download the video.
@@ -535,17 +519,75 @@ for tweet in reversed(tweets):
                 # > Store media id.
                 toot_videos_ids.append(media_id)
 
-                # > Remove the link.
-                tweet_content = tweet_content.replace(link, '')
-                link_handled = True
+                # > Remove the links to the video from the tweet content on success.
+                if is_video_link:
+                    tweet_content = tweet_content.replace(link, '')
+                    tweet_content = tweet_content.replace(dir_link, '')
+
+                # > If it was a '/photo/', and we success to download it as a video, it means it was (very likely) a GIF.
+                # > Mastodon seems to recognize them as GIF anyway (perhaps because they are short and looping ?)
+                # >   and accept to mix them with photos (it's usually not possible to mix photo and video in a toot).
+                # > But 'twint' put a static preview of them in `tweet['photos']`, which are going to be downloaded and posted.
+                # > This result in a weird toot where we see static preview of the GIF and the GIF aside.
+                # > The imperfect solution is to disable photo in a whole when we have photos, and make the assumption
+                # >   that someone who post a GIF will not post an image at the same time, else it will just appear as a link.
+                photos_enabled = False
+                
+                # > Next link.
+                continue
 
             except Exception as e:
                 print(log_prefix, 'Cannot upload video -', e)
+            
+        # > Handle 'pbs.twimg.com'
+        if 'https://pbs.twimg.com/' in link and photos_enabled:
+            media = None
 
+            print(log_prefix, 'Download photo "' + link + '".')
 
-        # > Link not handled: replace with direct link.
-        if link_handled == False:
-            tweet_content = tweet_content.replace(link, dir_link)
+            # > Try by passing by nitter.
+            if media is None:
+                try:
+                    media = requests.get(link.replace('https://pbs.twimg.com/', 'https://nitter.net/pic/orig/'))
+                except Exception as e:
+                    print(log_prefix, 'Failed to download the photo via nitter -', e)
+
+            # > Try by using the original link.
+            if media is None:
+                try:
+                    media = requests.get(link)
+                except Exception as e:
+                    print(log_prefix, 'Failed to download the photo via original url -', e)
+
+            # > Post.
+            if media is not None:
+                try:
+                    # > Post the photo.
+                    print(log_prefix, 'Upload photo to Mastodon server.')
+
+                    media_id = mastodon_media_post(mastodon_api, media.content, media.headers.get('content-type'), log_updater)
+
+                    print(log_prefix, 'Uploaded photo (' + str(media_id) + ').')
+
+                    # > Store media id.
+                    toot_photos_ids.append(media_id)
+
+                    # > Remove the links to the photo from the tweet content on success.
+                    tweet_content = tweet_content.replace(link, '')
+                    tweet_content = tweet_content.replace(dir_link, '')
+
+                    # > Next link.
+                    continue
+
+                except Exception as e:
+                    print(log_prefix, 'Cannot upload photo -', e)
+
+        # > Fallback: Handle other links.
+        tweet_content = tweet_content.replace(link, dir_link)
+
+    # > Remove photo ids, just in case a photo was placed before a video.
+    if photos_enabled == False:
+        toot_photos_ids = []
 
     # Remove ellipsis
     #tweet_content = tweet_content.replace('\xa0…', ' ')
