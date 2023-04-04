@@ -1,3 +1,5 @@
+#! /usr/bin/env python3
+
 import os.path
 from pathlib import Path
 import sys
@@ -101,7 +103,7 @@ def mastodon_media_post(mastodon_api, data, mime_type, updater = None):
             raise
         
 # Post a toot to mastodon.
-def mastodon_post(mastodon_api, tweet_content, photos_ids, videos_ids, updater = None):
+def mastodon_post(mastodon_api, tweet_content, in_reply_to_id, photos_ids, videos_ids, updater = None):
 
     # Updater helper.
     def lupdater(text):
@@ -120,7 +122,7 @@ def mastodon_post(mastodon_api, tweet_content, photos_ids, videos_ids, updater =
     while True:
         try:
             toot = mastodon_api.status_post(tweet_content,
-                                            in_reply_to_id = None,
+                                            in_reply_to_id = in_reply_to_id,
                                             media_ids = medias_ids,
                                             sensitive = False,
                                             visibility = 'unlisted',
@@ -144,10 +146,18 @@ def mastodon_post(mastodon_api, tweet_content, photos_ids, videos_ids, updater =
                 if try_count >= 2:
                     raise Exception('Unexpected mixed images and videos')
                 else:
-                    lupdater('mixed images and videos, will retry in 5 seconds with only videos (' + str(e) + ')')
+                    lupdater('mixed images and videos, will retry in 1 second with only videos (' + str(e) + ')')
                     medias_ids = videos_ids
-                    time.sleep(5)
-                    
+                    time.sleep(1)
+
+            elif '404' in description and 'the post you are trying to reply'.lower() in description:
+                if try_count >= 2:
+                    raise Exception('Unexpected reply to error')
+                else:
+                    lupdater('reply to id doesn\'t exist, will retry in 1 second without it (' + str(e) + ')')
+                    in_reply_to_id = None
+                    time.sleep(1)
+            
             else:
                 if try_count >= 5:
                     raise Exception('Got an unknown API error - ' + str(e))
@@ -247,10 +257,12 @@ def download_video(video_url, video_path, max_video_size_mb, updater = None):
 
 root_path = Path()
 
+
 # Check arguments.
 if len(sys.argv) < 5:
     print("Usage: python3 tootbot.py twitter_account mastodon_login mastodon_passwd mastodon_instance [max_days [footer_tags [delay]]]")
     sys.exit(1)
+
 
 # Extract arguments.
 twitter_account = sys.argv[1]
@@ -273,8 +285,10 @@ if len(sys.argv) > 7:
 else:
     delay = 0
 
+
 # Forge log prefix.
 log_prefix = twitter_account + ':'
+
 
 # Create directory for Twitter account.
 account_path = root_path.joinpath(twitter_account)
@@ -295,9 +309,33 @@ else:
 sql_path = account_path.joinpath('tootbot.db')
 
 try:
+    # > "Connect"
     sql = sqlite3.connect(sql_path)
     db = sql.cursor()
-    db.execute('''CREATE TABLE IF NOT EXISTS tweets (tweet text, toot text, twitter text, mastodon text, instance text)''')
+
+    # > List current columns of `tweets` table.
+    columns = list(map(lambda x: x[1], db.execute('PRAGMA table_info(tweets)')))
+
+    # > Check state of things.
+    old_columns = { 'tweet', 'toot', 'twitter', 'mastodon', 'instance' }
+
+    if len(columns) == 0:
+        print(log_prefix, 'Configure new database.')
+
+        db.execute('CREATE TABLE tweets (tweet_id TEXT, tweet_conversation_id TEXT, toot_id TEXT, twitter_account TEXT, mastodon_login TEXT, mastodon_instance TEXT)')
+    
+    if set(columns) == old_columns:
+        print(log_prefix, 'Update old database.')
+
+        db.execute('SAVEPOINT alter_tweets_table') # No need to `ROLLBACK TO SAVEPOINT``: changes before `RELEASE` will be lost when we exit on error anyway.
+        db.execute('ALTER TABLE tweets RENAME COLUMN tweet TO tweet_id')
+        db.execute('ALTER TABLE tweets RENAME COLUMN toot TO toot_id')
+        db.execute('ALTER TABLE tweets RENAME COLUMN twitter TO twitter_account')
+        db.execute('ALTER TABLE tweets RENAME COLUMN mastodon TO mastodon_login')
+        db.execute('ALTER TABLE tweets RENAME COLUMN instance TO mastodon_instance')
+        db.execute('ALTER TABLE tweets ADD COLUMN tweet_conversation_id TEXT')
+        db.execute('RELEASE SAVEPOINT alter_tweets_table')
+
 except Exception as e:
     print(log_prefix, 'Cannot create database file "' + str(sql_path) + '":', e)
     sys.exit(1)
@@ -332,6 +370,7 @@ except Exception as e:
     print(log_prefix, 'Login failed -', e)
     sys.exit(1)
 
+
 # Remove previous fetched tweets.
 for path in account_path.glob('tweets.*json'):
     unlink_path(path)
@@ -344,8 +383,8 @@ twitter_sjson_path = account_path.joinpath('tweets.sjson')
 twitter_json_path = account_path.joinpath('tweets.json')
 
 try:
-    subprocess.run("twint -u '%s' -tl --full-text --limit 10 --json -o '%s'" % (twitter_account, str(twitter_sjson_path),), shell = True, capture_output = True, check = True)
-    subprocess.run("jq -s . '%s' > '%s'" % (str(twitter_sjson_path), str(twitter_json_path),), shell = True, capture_output = True, check = True)
+    subprocess.run("twint -u '%s' -tl --full-text --limit 10 --json -o '%s'" % (twitter_account, str(twitter_sjson_path)), shell = True, capture_output = True, check = True)
+    subprocess.run("jq -s . '%s' > '%s'" % (str(twitter_sjson_path), str(twitter_json_path)), shell = True, capture_output = True, check = True)
 except Exception as e:
     print(log_prefix, 'Failed to fetch tweets -', e)
     sys.exit(1)
@@ -361,10 +400,11 @@ except Exception as e:
 print(log_prefix, 'Fetched', len(tweets), 'tweets.')
 
 for tweet in reversed(tweets):
+    tweet_id = tweet['id']
+    tweet_conversation_id = tweet['conversation_id']
+    tweet_username = tweet['username']
     tweet_content_raw =  tweet['tweet']
     tweet_content = html.unescape(tweet_content_raw)
-    tweet_id = tweet['id']
-    tweet_username = tweet['username']
     tweet_photos_url = []
 
     toot_photos_ids = []
@@ -390,7 +430,7 @@ for tweet in reversed(tweets):
 
     # Check if this tweet has been processed
     try:
-        db.execute('SELECT * FROM tweets WHERE tweet = ? AND twitter = ? and mastodon = ? and instance = ?', (tweet_id, twitter_account, mastodon_login, mastodon_instance))  # noqa
+        db.execute('SELECT * FROM tweets WHERE tweet_id = ? AND twitter_account = ? and mastodon_login = ? and mastodon_instance = ? LIMIT 1', (tweet_id, twitter_account, mastodon_login, mastodon_instance))  # noqa
         last = db.fetchone()
 
         if last:
@@ -399,7 +439,7 @@ for tweet in reversed(tweets):
         print(log_prefix, 'Cannot check if tweet', tweet_id, 'exist in database -', e)
         continue
 
-    print('Tweet - "' + tweet_content.replace('\n', ' ') + '"')
+    print(log_prefix, 'Tweet - "' + tweet_content.replace('\n', ' ') + '"')
 
     # Handle retweet.
     if twitter_account and tweet_username.lower() != twitter_account.lower():
@@ -521,19 +561,36 @@ for tweet in reversed(tweets):
     if footer_tags:
         tweet_content = tweet_content + '\n' + footer_tags
     
+    # Check if this tweet is part of a conversation.
+    toot_reply_to_id = None
+
+    if tweet_conversation_id is not None:
+        try:
+            db.execute('SELECT toot_id FROM tweets WHERE tweet_conversation_id = ? AND twitter_account = ? and mastodon_login = ? and mastodon_instance = ? ORDER BY rowid DESC LIMIT 1', (tweet_conversation_id, twitter_account, mastodon_login, mastodon_instance))  # noqa
+            last_tweet = db.fetchone()
+
+            if last_tweet is not None:
+                toot_reply_to_id = last_tweet[0]
+       
+        except Exception as e:
+            print(log_prefix, 'Cannot check if tweet', tweet_id, 'is part of a conversation -', e)
+
     # Post.
-    print(log_prefix, 'Posting toot.')
+    if toot_reply_to_id is None:
+        print(log_prefix, 'Posting toot.')
+    else:
+        print(log_prefix, 'Posting toot as reply of toot ' + toot_reply_to_id + ' (twitter conversation ' + tweet_conversation_id + ').')
 
     try:
         # > Post the toot.
-        toot = mastodon_post(mastodon_api, tweet_content, toot_photos_ids, toot_videos_ids, log_updater)
+        toot = mastodon_post(mastodon_api, tweet_content, toot_reply_to_id, toot_photos_ids, toot_videos_ids, log_updater)
 
         # > Save in database.
-        db.execute("INSERT INTO tweets VALUES ( ? , ? , ? , ? , ? )", (tweet_id, toot["id"], twitter_account, mastodon_login, mastodon_instance))
+        db.execute("INSERT INTO tweets (tweet_id, tweet_conversation_id, toot_id, twitter_account, mastodon_login, mastodon_instance) VALUES (?, ?, ?, ?, ?, ?)", (tweet_id, tweet_conversation_id, toot["id"], twitter_account, mastodon_login, mastodon_instance))
         sql.commit()
         
         # > Log post.
-        print(log_prefix, 'Tweet created at', tweet['created_at'], "posted.")
+        print(log_prefix, 'Tweet ' + str(tweet_id) + ' created at ' + str(tweet['created_at']) + ' has been posted on ' + mastodon_instance + ' (' + str(toot["id"]) + ').')
 
     except Exception as e:
         print(log_prefix, e, '- skip tweet.')
