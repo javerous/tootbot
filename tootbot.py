@@ -1,7 +1,7 @@
 #! /usr/bin/env python3
 
 import os.path
-from pathlib import Path
+from pathlib import Path, PurePath
 import sys
 import re
 import html
@@ -20,6 +20,8 @@ import requests
 
 from decimal import *
 
+from urllib.parse import urlparse
+
 
 '''
 Note:
@@ -33,6 +35,7 @@ It has some advantages (simple interface, direct JSON output on stdout, etc.), b
 
 Let stay on Twint for now.
 '''
+
 
 
 ############################################################################################
@@ -80,7 +83,7 @@ def unredir(redir):
     return redir
 
 # Remove a file and ignore errors.
-def unlink_path(file_path):
+def unlink_noerr(file_path):
     try:
         file_path.unlink();
     except:
@@ -164,11 +167,28 @@ def mastodon_post(mastodon_api, tweet_content, in_reply_to_id, photos_ids, video
                     medias_ids = videos_ids
                     time.sleep(1)
 
+            elif '422' in description and 'Unprocessable Entity'.lower() in description and 'Cannot attach more than'.lower() in description:
+                if medias_ids is None or len(medias_ids) == 0:
+                    raise Exception('Unexpected too much attached medias')
+                else:
+                    lupdater('too much medias, will retry in 1 second with last one removed (' + str(e) + ')')
+
+                    medias_ids.pop()
+
+                    if len(medias_ids) == 0:
+                        medias_ids = None
+                
+                    time.sleep(1)
+
+            elif '422' in description and 'Unprocessable Entity'.lower() in description and 'text character limit of'.lower() in description:
+                lupdater('toot is to big')
+                return { 'id' : -2 } # This error will never solve, we don't want to retry forever: give an invalid toot_id to consider it as processed.
+
             elif '404' in description and 'the post you are trying to reply'.lower() in description:
                 if try_count >= 2:
-                    raise Exception('Unexpected reply to error')
+                    raise Exception('Unexpected "reply to" error')
                 else:
-                    lupdater('reply to id doesn\'t exist, will retry in 1 second without it (' + str(e) + ')')
+                    lupdater('"reply to" id doesn\'t exist, will retry in 1 second without it (' + str(e) + ')')
                     in_reply_to_id = None
                     time.sleep(1)
             
@@ -182,6 +202,59 @@ def mastodon_post(mastodon_api, tweet_content, in_reply_to_id, photos_ids, video
         except Exception as e:
             raise
 
+# Fetch Twitter tweet.
+def fetch_tweet(tweet_url, tmp_dir_path = Path('/tmp/')):
+    # Parse.
+    parse_result = urlparse(tweet_url)
+    path = PurePath(parse_result.path)
+
+    # Validate.
+    if parse_result.scheme != 'http' and parse_result.scheme != 'https':
+        raise Exception('invalid scheme "' + parse_result.scheme + '"')
+
+    if len(path.parts) != 4:
+        raise Exception('invalid path "' + str(path) + '"')
+    
+    # Extract parts.
+    twitter_username = path.parts[1]
+    tweet_id = int(path.parts[3])
+
+    # Fetch tweet.
+    tmp_sjson_path = tmp_dir_path.joinpath(twitter_username + '_' + str(tweet_id) + '.sjson')
+    tmp_json_path = tmp_dir_path.joinpath(twitter_username + '_' + str(tweet_id) + '.json')
+
+    try:
+        subprocess.run("twint -u '%s' -s 'since_id:%s and max_id:%s' --full-text --limit 1 --json -o '%s'" %
+                       (twitter_username, str(tweet_id - 1), str(tweet_id), str(tmp_sjson_path)), shell = True, capture_output = True, check = True)
+
+        subprocess.run("jq -s . '%s' > '%s'" % (str(tmp_sjson_path), str(tmp_json_path)), shell = True, capture_output = True, check = True)
+    except Exception as e:
+        unlink_noerr(tmp_sjson_path)
+        unlink_noerr(tmp_json_path)
+        return(twitter_username, tweet_id, None)
+
+    unlink_noerr(tmp_sjson_path)
+
+    # Parse JSON.
+    try:
+        tweets = json.load(open(tmp_json_path, 'r'))
+    except Exception as e:
+        return(twitter_username, tweet_id, None)
+    finally:
+        unlink_noerr(tmp_json_path)
+
+    # Check we found a tweet.
+    if len(tweets) <= 0:
+        return(twitter_username, tweet_id, None)
+
+    # Check we found the tweet
+    tweet = tweets[0]
+
+    if tweet['id'] != tweet_id and tweet['conversation_id'] != str(tweet_id) and tweet['conversation_id'] != tweet_id and tweet['link'].lower() != tweet_url.lower():
+        return(twitter_username, tweet_id, None)
+
+    return(twitter_username, tweet_id, tweet)
+
 # Download and recompress a video.
 def download_video(video_url, video_path, max_video_size_mb, updater = None):
 
@@ -191,7 +264,7 @@ def download_video(video_url, video_path, max_video_size_mb, updater = None):
             updater(text)
     
     # Remove file, in case the directory is dirty.
-    unlink_path(video_path)
+    unlink_noerr(video_path)
 
     # Download video.
     lupdater("downloading the video")
@@ -200,7 +273,7 @@ def download_video(video_url, video_path, max_video_size_mb, updater = None):
         subprocess.run("yt-dlp -o '%s' -N 8 -f b -S 'filesize~%sM' --recode-video mp4 --no-playlist --max-filesize 500M '%s'" %
                         (str(video_path), str(max_video_size_mb), video_url), shell = True, capture_output = False, check = True)
     except Exception as e:
-        unlink_path(video_path)
+        unlink_noerr(video_path)
         raise
     
     lupdater("video downloaded")
@@ -238,7 +311,7 @@ def download_video(video_url, video_path, max_video_size_mb, updater = None):
 
             # > Remove previous pass files, in case the directory is dirty.
             for path in pass_video_path_prefix.parent.glob(pass_video_path_prefix.name + '*'):
-                unlink_path(path)
+                unlink_noerr(path)
 
             # > Encode the video in 2 passes, for better size accuracy.
             subprocess.run("ffmpeg -y -i '%s' -c:v libx264 -b:v %sk -pass 1 -an -f mp4 -passlogfile '%s' -loglevel error -stats /dev/null" %
@@ -259,10 +332,10 @@ def download_video(video_url, video_path, max_video_size_mb, updater = None):
     finally:
         # > Remove pass files, in case the directory is dirty.
         for path in pass_video_path_prefix.parent.glob(pass_video_path_prefix.name + '*'):
-            unlink_path(path)
+            unlink_noerr(path)
         
         # > Remove temp file.
-        unlink_path(tmp_video_path)
+        unlink_noerr(tmp_video_path)
 
 
 
@@ -349,6 +422,7 @@ try:
         db.execute('ALTER TABLE tweets RENAME COLUMN instance TO mastodon_instance')
         db.execute('ALTER TABLE tweets ADD COLUMN tweet_conversation_id TEXT')
         db.execute('RELEASE SAVEPOINT alter_tweets_table')
+        sql.commit()
 
 except Exception as e:
     print(log_prefix, 'Cannot create database file "' + str(sql_path) + '":', e)
@@ -387,7 +461,7 @@ except Exception as e:
 
 # Remove previous fetched tweets.
 for path in account_path.glob('tweets.*json'):
-    unlink_path(path)
+    unlink_noerr(path)
 
 
 # Fetch tweets.
@@ -423,25 +497,13 @@ for tweet in reversed(tweets):
     toot_photos_ids = []
     toot_videos_ids = []
 
+    links = []
+
     # Define log helper.
     def log_updater(text):
         print(log_prefix, text.capitalize() + '.')
 
-    # Do not toot twitter replies.
-    if 'reply_to' in tweet and len(tweet['reply_to'])>0:
-        print(log_prefix, 'Reply - "' + tweet_content.replace('\n', ' ') + '".')
-        continue
-    
-    # Do not toot twitter quoted RT. XXX Perhaps reconsider that.
-    if 'quote_url' in tweet and tweet['quote_url'] != '':
-        print(log_prefix, 'Quoted - "' + tweet_content.replace('\n', ' ') + '".')
-        continue
-
-    # Skip invalid content.
-    if tweet_content[-1] == "…":
-        continue
-
-    # Check if this tweet has been processed
+    # Check if this tweet has been processed.
     try:
         db.execute('SELECT * FROM tweets WHERE tweet_id = ? AND twitter_account = ? and mastodon_login = ? and mastodon_instance = ? LIMIT 1', (tweet_id, twitter_account, mastodon_login, mastodon_instance))  # noqa
         last = db.fetchone()
@@ -452,21 +514,85 @@ for tweet in reversed(tweets):
         print(log_prefix, 'Cannot check if tweet', tweet_id, 'exist in database -', e)
         continue
 
-    print(log_prefix, 'Tweet - "' + tweet_content.replace('\n', ' ') + '"')
+    # Do not toot twitter replies.
+    if 'reply_to' in tweet and len(tweet['reply_to']) > 0:
+        # > Log.
+        print(log_prefix, 'Reply (Skipped) - "' + tweet_content.replace('\n', ' ') + '".')
+
+        # > Consider it as processed.
+        db.execute("INSERT INTO tweets (tweet_id, tweet_conversation_id, toot_id, twitter_account, mastodon_login, mastodon_instance) VALUES (?, ?, ?, ?, ?, ?)", (tweet_id, tweet_conversation_id, -1, twitter_account, mastodon_login, mastodon_instance))
+        sql.commit()
+
+        continue
+
+    # Handle bogus RTs. They start with 'RT @username: '.
+    bogus_rt_unrecoverable = re.match(r'^RT\s+@[^:]+:\s.*…', tweet_content, flags = re.DOTALL | re.IGNORECASE)
+    bogus_rt_recoverable = re.match(r'^(RT\s+@([^:]+):\s).*', tweet_content, flags = re.DOTALL | re.IGNORECASE)
+
+    if bogus_rt_unrecoverable is not None:
+        print(log_prefix, 'Bogus RT (Skipped) - "' + tweet_content.replace('\n', ' ') + '".')
+        continue
+    elif bogus_rt_recoverable is not None:
+        print(log_prefix, 'Bogus RT (Recovered) - "' + tweet_content.replace('\n', ' ') + '".')
+
+        # > Fix username, as a non-bogus RT.
+        tweet_username = bogus_rt_recoverable.group(2)
+
+        # > Remove the RT part in the content.`
+        span = bogus_rt_recoverable.span(1)
+        tweet_content = tweet_content[:span[0]] + tweet_content[span[1]:]
+    else:
+        print(log_prefix, 'Tweet - "' + tweet_content.replace('\n', ' ') + '"')
 
     # Handle retweet.
     if twitter_account and tweet_username.lower() != twitter_account.lower():
-        tweet_content = ('RT https://twitter.com/%s\n' % tweet_username) + tweet_content
+        tweet_content = ('🔄 @%s@twitter.com\n\n%s' % (tweet_username, tweet_content))
+    
+    # Handle quote tweet. Note: a quote tweet can be retweeted.
+    quoted_tweet_images = None
 
-    # Extract links.
-    links = re.findall(r"http[^ \xa0]*", tweet_content)
+    if 'quote_url' in tweet and tweet['quote_url'] != '':
+        quote_url = tweet['quote_url']
+
+        print(log_prefix, 'Handle quoted tweet "' + quote_url + '".')
+
+        try:
+            # Fetch quoted tweet.
+            fetch_result = fetch_tweet(quote_url, account_path)
+            quoted_twitter_username = fetch_result[0]
+            quoted_tweet = fetch_result[2]
+
+            # Generate quoted content.
+            if quoted_tweet is None or 'tweet' not in quoted_tweet:
+                print(log_prefix, 'Failed to fetch quoted tweet "' + quote_url + '".')
+                quoted_content = ('@%s@twitter.com\n\n%s' % (quoted_twitter_username, quote_url))
+            else:
+                quoted_tweet_content_raw =  quoted_tweet['tweet']
+                quoted_tweet_content = html.unescape(quoted_tweet_content_raw)
+
+                quoted_content = ('@%s@twitter.com\n\n%s' % (quoted_twitter_username, quoted_tweet_content))
+
+                if 'photos' in quoted_tweet:
+                    quoted_tweet_images = quoted_tweet['photos']
+
+        except Exception as e:
+            print(log_prefix, 'Invalid quote url "' + quote_url + '" -', e)
+            quoted_content = quote_url
+
+        # Generate tweet content.
+        tweet_content = tweet_content + ('\n\n———\n🔄 %s' % quoted_content)
+
+    # Gather all links. Note: '\xa0' is unicode whitespace.
+    links = re.findall(r'https?://[^\s\xa0]+', tweet_content)
     
     if 'photos' in tweet:
         links = links + tweet['photos']
 
+    if quoted_tweet_images is not None:
+        links = links + quoted_tweet_images
+
     # Handle links.
     handled_links = set()
-    photos_enabled = True
 
     for link in links:
 
@@ -523,15 +649,6 @@ for tweet in reversed(tweets):
                 if is_video_link:
                     tweet_content = tweet_content.replace(link, '')
                     tweet_content = tweet_content.replace(dir_link, '')
-
-                # > If it was a '/photo/', and we success to download it as a video, it means it was (very likely) a GIF.
-                # > Mastodon seems to recognize them as GIF anyway (perhaps because they are short and looping ?)
-                # >   and accept to mix them with photos (it's usually not possible to mix photo and video in a toot).
-                # > But 'twint' put a static preview of them in `tweet['photos']`, which are going to be downloaded and posted.
-                # > This result in a weird toot where we see static preview of the GIF and the GIF aside.
-                # > The imperfect solution is to disable photo in a whole when we have photos, and make the assumption
-                # >   that someone who post a GIF will not post an image at the same time, else it will just appear as a link.
-                photos_enabled = False
                 
                 # > Next link.
                 continue
@@ -540,8 +657,13 @@ for tweet in reversed(tweets):
                 print(log_prefix, 'Cannot upload video -', e)
             
         # > Handle 'pbs.twimg.com'
-        if 'https://pbs.twimg.com/' in link and photos_enabled:
+        if 'https://pbs.twimg.com/' in link:
             media = None
+
+            # > Skip video thumbnails. Video are completely attached in previous section.
+            if '/tweet_video_thumb/' in link:
+                print(log_prefix, 'Skip thumbnail photo "' + link + '".')
+                continue
 
             print(log_prefix, 'Download photo "' + link + '".')
 
@@ -585,10 +707,6 @@ for tweet in reversed(tweets):
         # > Fallback: Handle other links.
         tweet_content = tweet_content.replace(link, dir_link)
 
-    # > Remove photo ids, just in case a photo was placed before a video.
-    if photos_enabled == False:
-        toot_photos_ids = []
-
     # Remove ellipsis
     #tweet_content = tweet_content.replace('\xa0…', ' ')
 
@@ -597,9 +715,30 @@ for tweet in reversed(tweets):
     # Replace links to twitter by nitter ones.
     tweet_content = tweet_content.replace('/twitter.com/', '/nitter.net/')
 
+    # Replace Twitter handles by Mastodon style handle:
+    # - Avoid Twitter handles which may reference unrelated Mastodon users.
+    # - Some Mastodon clients recognize these handles, and will create a link to Twitter.
+    #
+    # Note: we can't use re.sub: we need to skip entries which are already Mastodon
+    #  handles (if someone Tweet a Mastodon handle for example), so we need to match
+    #  a 'separator' caracter before and after Twitter handle, but doing so
+    #  will make re.sub to don't see 2 handles separated by this separator (a space, for example).
+    while True:
+        match = re.search(r'(^|[^a-zA-Z0-9_@])(@[a-zA-Z0-9_]{1,15})($|[^a-zA-Z0-9_@])', tweet_content)
+
+        if match is None:
+            break
+    
+        span1 = match.span(1) # First 'separator' group.
+        span2 = match.span(3) # Second 'separator' group.
+
+        #               ... (^|[...])]           + Twitter handle + @twitter.com   + [($|[...]) ...
+        tweet_content = tweet_content[:span1[1]] + match.group(2) + '@twitter.com' + tweet_content[span2[0]:]
+
     # Replace utm_? tracking.
     tweet_content = re.sub('\?utm.*$', '?utm_medium=Social&utm_source=Mastodon', tweet_content)
 
+    # Add footer tags.
     if footer_tags:
         tweet_content = tweet_content + '\n' + footer_tags
     
@@ -612,7 +751,10 @@ for tweet in reversed(tweets):
             last_tweet = db.fetchone()
 
             if last_tweet is not None:
-                toot_reply_to_id = last_tweet[0]
+                last_tweet_id = last_tweet[0]
+            
+                if last_tweet_id > 0:
+                    toot_reply_to_id = last_tweet_id
        
         except Exception as e:
             print(log_prefix, 'Cannot check if tweet', tweet_id, 'is part of a conversation -', e)
@@ -636,3 +778,5 @@ for tweet in reversed(tweets):
 
     except Exception as e:
         print(log_prefix, e, '- skip tweet.')
+
+print(log_prefix, 'Done.')
