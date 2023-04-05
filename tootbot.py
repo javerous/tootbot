@@ -498,8 +498,6 @@ for tweet in reversed(tweets):
     toot_photos_ids = []
     toot_videos_ids = []
 
-    links = []
-
     # Define log helper.
     def log_updater(text):
         print(log_prefix, text.capitalize() + '.')
