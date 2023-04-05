@@ -231,7 +231,8 @@ def fetch_tweet(tweet_url, tmp_dir_path = Path('/tmp/')):
     except Exception as e:
         unlink_noerr(tmp_sjson_path)
         unlink_noerr(tmp_json_path)
-        return(twitter_username, tweet_id, None)
+
+        return (twitter_username, tweet_id, None)
 
     unlink_noerr(tmp_sjson_path)
 
@@ -239,21 +240,21 @@ def fetch_tweet(tweet_url, tmp_dir_path = Path('/tmp/')):
     try:
         tweets = json.load(open(tmp_json_path, 'r'))
     except Exception as e:
-        return(twitter_username, tweet_id, None)
+        return (twitter_username, tweet_id, None)
     finally:
         unlink_noerr(tmp_json_path)
 
     # Check we found a tweet.
     if len(tweets) <= 0:
-        return(twitter_username, tweet_id, None)
+        return (twitter_username, tweet_id, None)
 
     # Check we found the tweet
     tweet = tweets[0]
 
     if tweet['id'] != tweet_id and tweet['conversation_id'] != str(tweet_id) and tweet['conversation_id'] != tweet_id and tweet['link'].lower() != tweet_url.lower():
-        return(twitter_username, tweet_id, None)
+        return (twitter_username, tweet_id, None)
 
-    return(twitter_username, tweet_id, tweet)
+    return (twitter_username, tweet_id, tweet)
 
 # Download and recompress a video.
 def download_video(video_url, video_path, max_video_size_mb, updater = None):
