@@ -89,7 +89,21 @@ def unlink_noerr(file_path):
     except:
         pass
 
-# Post a media to Mastodon.
+# Return an integer from int or str.
+def int_value(value):
+
+    if value is None:
+        return None
+
+    if isinstance(value, int):
+        return value
+    
+    try:
+        return int(value)
+    except:
+        return -1
+    
+# Post a media to Mastodon. Return int media id.
 def mastodon_media_post(mastodon_api, data, mime_type, updater = None):
 
     # Updater helper.
@@ -105,7 +119,7 @@ def mastodon_media_post(mastodon_api, data, mime_type, updater = None):
         try:
             media_posted = mastodon_api.media_post(data, mime_type = mime_type)
 
-            return media_posted['id']
+            return int_value(media_posted['id'])
                         
         except MastodonBadGatewayError as e:
             try_count = try_count + 1
@@ -119,7 +133,7 @@ def mastodon_media_post(mastodon_api, data, mime_type, updater = None):
         except Exception as e:
             raise
         
-# Post a toot to mastodon.
+# Post a toot to mastodon. Return toot dictionary.
 def mastodon_post(mastodon_api, tweet_content, in_reply_to_id, photos_ids, videos_ids, updater = None):
 
     # Updater helper.
@@ -217,7 +231,7 @@ def fetch_tweet(tweet_url, tmp_dir_path = Path('/tmp/')):
     
     # Extract parts.
     twitter_username = path.parts[1]
-    tweet_id = int(path.parts[3])
+    tweet_id = int_value(path.parts[3])
 
     # Fetch tweet.
     tmp_sjson_path = tmp_dir_path.joinpath(twitter_username + '_' + str(tweet_id) + '.sjson')
@@ -251,7 +265,7 @@ def fetch_tweet(tweet_url, tmp_dir_path = Path('/tmp/')):
     # Check we found the tweet
     tweet = tweets[0]
 
-    if tweet['id'] != tweet_id and tweet['conversation_id'] != str(tweet_id) and tweet['conversation_id'] != tweet_id and tweet['link'].lower() != tweet_url.lower():
+    if int_value(tweet['id']) != tweet_id and int_value(tweet['conversation_id']) != tweet_id and tweet['link'].lower() != tweet_url.lower():
         return (twitter_username, tweet_id, None)
 
     return (twitter_username, tweet_id, tweet)
@@ -397,6 +411,8 @@ else:
 sql_path = account_path.joinpath('tootbot.db')
 
 try:
+    # XXX at some point, we should change the id column to be int and not text...
+
     # > "Connect"
     sql = sqlite3.connect(sql_path)
     db = sql.cursor()
@@ -489,8 +505,8 @@ except Exception as e:
 print(log_prefix, 'Fetched', len(tweets), 'tweets.')
 
 for tweet in reversed(tweets):
-    tweet_id = tweet['id']
-    tweet_conversation_id = tweet['conversation_id']
+    tweet_id = int_value(tweet['id'])
+    tweet_conversation_id = int_value(tweet['conversation_id'])
     tweet_username = tweet['username']
     tweet_content_raw =  tweet['tweet']
     tweet_content = html.unescape(tweet_content_raw)
@@ -510,7 +526,7 @@ for tweet in reversed(tweets):
         if last:
             continue
     except Exception as e:
-        print(log_prefix, 'Cannot check if tweet', tweet_id, 'exist in database -', e)
+        print(log_prefix, 'Cannot check if tweet ' + str(tweet_id) + ' exist in database -', e)
         continue
 
     # Do not toot twitter replies.
@@ -529,7 +545,13 @@ for tweet in reversed(tweets):
     bogus_rt_recoverable = re.match(r'^(RT\s+@([^:]+):\s).*', tweet_content, flags = re.DOTALL | re.IGNORECASE)
 
     if bogus_rt_unrecoverable is not None:
+        # > Log
         print(log_prefix, 'Bogus RT (Skipped) - "' + tweet_content.replace('\n', ' ') + '".')
+
+        # > Consider it as processed.
+        db.execute("INSERT INTO tweets (tweet_id, tweet_conversation_id, toot_id, twitter_account, mastodon_login, mastodon_instance) VALUES (?, ?, ?, ?, ?, ?)", (tweet_id, tweet_conversation_id, -3, twitter_account, mastodon_login, mastodon_instance))
+        sql.commit()
+
         continue
     elif bogus_rt_recoverable is not None:
         print(log_prefix, 'Bogus RT (Recovered) - "' + tweet_content.replace('\n', ' ') + '".')
@@ -750,30 +772,31 @@ for tweet in reversed(tweets):
             last_tweet = db.fetchone()
 
             if last_tweet is not None:
-                last_tweet_id = last_tweet[0]
+                last_tweet_id = int_value(last_tweet[0])
             
                 if last_tweet_id > 0:
                     toot_reply_to_id = last_tweet_id
        
         except Exception as e:
-            print(log_prefix, 'Cannot check if tweet', tweet_id, 'is part of a conversation -', e)
+            print(log_prefix, 'Cannot check if tweet ' +  str(tweet_id) + ' is part of a conversation -', e)
 
     # Post.
     if toot_reply_to_id is None:
         print(log_prefix, 'Posting toot.')
     else:
-        print(log_prefix, 'Posting toot as reply of toot ' + toot_reply_to_id + ' (twitter conversation ' + tweet_conversation_id + ').')
+        print(log_prefix, 'Posting toot as reply of toot ' + str(toot_reply_to_id) + ' (twitter conversation ' + str(tweet_conversation_id) + ').')
 
     try:
         # > Post the toot.
         toot = mastodon_post(mastodon_api, tweet_content, toot_reply_to_id, toot_photos_ids, toot_videos_ids, log_updater)
+        toot_id = int_value(toot["id"])
 
         # > Save in database.
-        db.execute("INSERT INTO tweets (tweet_id, tweet_conversation_id, toot_id, twitter_account, mastodon_login, mastodon_instance) VALUES (?, ?, ?, ?, ?, ?)", (tweet_id, tweet_conversation_id, toot["id"], twitter_account, mastodon_login, mastodon_instance))
+        db.execute("INSERT INTO tweets (tweet_id, tweet_conversation_id, toot_id, twitter_account, mastodon_login, mastodon_instance) VALUES (?, ?, ?, ?, ?, ?)", (tweet_id, tweet_conversation_id, toot_id, twitter_account, mastodon_login, mastodon_instance))
         sql.commit()
         
         # > Log post.
-        print(log_prefix, 'Tweet ' + str(tweet_id) + ' created at ' + str(tweet['created_at']) + ' has been posted on ' + mastodon_instance + ' (' + str(toot["id"]) + ').')
+        print(log_prefix, 'Tweet ' + str(tweet_id) + ' created at ' + str(tweet['created_at']) + ' has been posted on ' + mastodon_instance + ' (' + str(toot_id) + ').')
 
     except Exception as e:
         print(log_prefix, e, '- skip tweet.')
