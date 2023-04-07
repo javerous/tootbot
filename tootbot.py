@@ -126,14 +126,41 @@ def safe_dict(dict, path, default = None):
         return default
     
     return value
+
+# Replace substrings of a string if it don't make it exceed some length.
+def safe_replace(string, oldvalue, newvalue, max_length, logger = None):
+
+    # Logger helper.
+    def llogger(*args):
+        if logger is not None:
+            logger(*args)
+
+    # Replace
+    result = string.replace(oldvalue, newvalue)
+
+    # Check result.
+    if len(result) > max_length:
+        llogger('can\'t replace "', oldvalue, '" with "', newvalue, '", result is too long - ', len(result), ' > ', max_length)
+        return string
+    
+    return result
+
+# Concatenate string representation of random objets.
+def stringify(*args):
+    result = ''
+
+    for arg in args:
+        result += str(arg)
+
+    return result
     
 # Post a media to Mastodon. Return int media id.
-def mastodon_media_post(mastodon_api, data, mime_type, updater = None):
+def mastodon_media_post(mastodon_api, data, mime_type, logger = None):
 
-    # Updater helper.
-    def lupdater(text):
-        if updater is not None:
-            updater(text)
+    # Logger helper.
+    def llogger(*args):
+        if logger is not None:
+            logger(*args)
 
     # Prepate things.
     try_count = 0
@@ -151,26 +178,26 @@ def mastodon_media_post(mastodon_api, data, mime_type, updater = None):
             if try_count >= 10:
                 raise
             else:
-                lupdater('unable to send media, will retry in 10 seconds (' + str(e) + ')')
+                llogger('unable to send media, will retry in 10 seconds - ', e)
                 time.sleep(10)
 
         except MastodonInternalServerError as e:
             if try_count >= 5:
                 raise
             else:
-                lupdater('unable to send media, will retry in 10 seconds (' + str(e) + ')')
+                llogger('unable to send media, will retry in 10 seconds - ', e)
                 time.sleep(10)
                         
         except Exception as e:
             raise
         
 # Post a toot to mastodon. Return toot dictionary.
-def mastodon_post(mastodon_api, tweet_content, in_reply_to_id, photos_ids, videos_ids, updater = None):
+def mastodon_post(mastodon_api, tweet_content, in_reply_to_id, photos_ids, videos_ids, logger = None):
 
-    # Updater helper.
-    def lupdater(text):
-        if updater is not None:
-            updater(text)
+    # Logger helper.
+    def llogger(*args):
+        if logger is not None:
+            logger(*args)
 
     # Prepare things.
     try_count = 0
@@ -201,14 +228,14 @@ def mastodon_post(mastodon_api, tweet_content, in_reply_to_id, photos_ids, video
                 if try_count >= 10:
                     raise Exception('Medias take too long to proceed')
                 else:
-                    lupdater('medias are still processing, will retry in 10 seconds (' + str(e) + ')')
+                    llogger('medias are still processing, will retry in 10 seconds - ', e)
                     time.sleep(10)
 
             elif '422' in description and 'Unprocessable Entity'.lower() in description and 'Cannot attach a video to a post that already contains images'.lower() in description:
                 if try_count >= 2:
                     raise Exception('Unexpected mixed images and videos')
                 else:
-                    lupdater('mixed images and videos, will retry in 1 second with only videos (' + str(e) + ')')
+                    llogger('mixed images and videos, will retry in 1 second with only videos - ', e)
                     medias_ids = videos_ids
                     time.sleep(1)
 
@@ -216,7 +243,7 @@ def mastodon_post(mastodon_api, tweet_content, in_reply_to_id, photos_ids, video
                 if medias_ids is None or len(medias_ids) == 0:
                     raise Exception('Unexpected too much attached medias')
                 else:
-                    lupdater('too much medias, will retry in 1 second with last one removed (' + str(e) + ')')
+                    llogger('too much medias, will retry in 1 second with last one removed - ', e)
 
                     medias_ids.pop()
 
@@ -226,22 +253,22 @@ def mastodon_post(mastodon_api, tweet_content, in_reply_to_id, photos_ids, video
                     time.sleep(1)
 
             elif '422' in description and 'Unprocessable Entity'.lower() in description and 'text character limit of'.lower() in description:
-                lupdater('toot is to big')
+                llogger('toot is to big')
                 return { 'id' : -2 } # This error will never solve, we don't want to retry forever: give an invalid toot_id to consider it as processed.
 
             elif '404' in description and 'the post you are trying to reply'.lower() in description:
                 if try_count >= 2:
                     raise Exception('Unexpected "reply to" error')
                 else:
-                    lupdater('"reply to" id doesn\'t exist, will retry in 1 second without it (' + str(e) + ')')
+                    llogger('the "reply to" id doesn\'t exist, will retry in 1 second without it - ', e)
                     in_reply_to_id = None
                     time.sleep(1)
             
             else:
                 if try_count >= 5:
-                    raise Exception('Got an unknown API error - ' + str(e))
+                    raise Exception('got an unknown API error - ' + str(e))
                 else:
-                    lupdater('got an unknown API error, will retry in 10 seconds (' + str(e) + ')')
+                    llogger('got an unknown API error, will retry in 10 seconds - ', e)
                     time.sleep(10)
 
         except Exception as e:
@@ -329,20 +356,20 @@ def fetch_tweet(tweet_url, tmp_dir_path = Path('/tmp/')):
     return (twitter_username, tweet_id, None)
 
 # Download and recompress a video.
-def download_video(video_url, video_path, max_video_size, updater = None):
+def download_video(video_url, video_path, max_video_size, logger = None):
 
     max_video_size_mib = max_video_size / (1024 * 1024)
 
-    # Updater helper.
-    def lupdater(text):
-        if updater is not None:
-            updater(text)
+    # Logger helper.
+    def llogger(*args):
+        if logger is not None:
+            logger(*args)
     
     # Remove file, in case the directory is dirty.
     unlink_noerr(video_path)
 
     # Download video.
-    lupdater("downloading the video")
+    llogger("downloading the video")
 
     try:
         subprocess.run("yt-dlp -o '%s' -N 8 -f b -S 'filesize~%sM' --recode-video mp4 --no-playlist --max-filesize 500M '%s'" %
@@ -351,7 +378,7 @@ def download_video(video_url, video_path, max_video_size, updater = None):
         unlink_noerr(video_path)
         raise
     
-    lupdater("video downloaded")
+    llogger("video downloaded")
 
     # Recompress
     try:
@@ -361,7 +388,7 @@ def download_video(video_url, video_path, max_video_size, updater = None):
         size = os.lstat(video_path).st_size
                     
         if size > max_video_size:
-            lupdater('video too big (%s > %s), recompressing' % (size, max_video_size))
+            llogger('video too big (%s > %s), recompressing' % (size, max_video_size))
             
             # > Compute the needed bitrate.
             duration_result = subprocess.run("ffprobe -v error -show_entries format=duration -of csv=p=0 '%s'"
@@ -402,7 +429,7 @@ def download_video(video_url, video_path, max_video_size, updater = None):
             tmp_video_path.rename(video_path)
 
     except Exception as e:
-            lupdater("unable to recompress video (" + str(e) + ")")
+            llogger('unable to recompress video - ', e)
 
     finally:
         # > Remove pass files, in case the directory is dirty.
@@ -451,19 +478,29 @@ else:
 # Forge log prefix.
 log_prefix = twitter_account + ':'
 
+def log(*args):
+    result = stringify(*args).capitalize()
+
+    if len(result) > 0:
+        result = result[:1].upper() + result[1:]
+
+    if len(result) > 0 and result[-1] != '.':
+        result += '.'
+
+    print(log_prefix, result.replace('\n', ' '))
 
 # Create directory for Twitter account.
 account_path = root_path.joinpath(twitter_account)
 
 if account_path.exists():
     if not account_path.is_dir():
-        print(log_prefix, 'Cannot create directory "' + str(account_path) + '" because a file with this name altready exists.')
+        log('cannot create directory "', account_path, '" because a file with this name altready exists')
         sys.exit(1)
 else:
     try:
         os.mkdir(twitter_account)
     except Exception as e:
-        print(log_prefix, 'Cannot create directory "'+ str(account_path) + '":', e)
+        log('cannot create directory "', account_path, '" - ', e)
         sys.exit(1)
 
 
@@ -480,12 +517,12 @@ try:
     old_columns = { 'tweet', 'toot', 'twitter', 'mastodon', 'instance' }
 
     if len(columns) == 0:
-        print(log_prefix, 'Configure new database.')
+        log('configure new database')
 
         db.execute('CREATE TABLE tweets (tweet_id INT, tweet_conversation_id INT, toot_id INT, twitter_account TEXT, mastodon_login TEXT, mastodon_instance TEXT)')
     
     if set(columns) == old_columns:
-        print(log_prefix, 'Update table columns names.')
+        log('update table columns names')
 
         db.execute('SAVEPOINT rename_tweets_table') # No need to `ROLLBACK TO SAVEPOINT``: changes before `RELEASE` will be lost when we exit on error anyway.
         db.execute('ALTER TABLE tweets RENAME COLUMN tweet TO tweet_id')
@@ -504,7 +541,7 @@ try:
         columns[column[1]] = column[2].lower()
     
     if columns['tweet_id'] == 'text' or columns['toot_id'] == 'text' or columns['tweet_conversation_id'] == 'text':
-        print(log_prefix, 'Update table columns types.')
+        log('update table columns types')
 
         db.execute('SAVEPOINT retype_tweets_table')
 
@@ -530,7 +567,7 @@ try:
         sql.commit()
 
 except Exception as e:
-    print(log_prefix, 'Cannot open database file "' + str(sql_path) + '":', e)
+    log('cannot open database file "', sql_path, '" - ', e)
     sys.exit(1)
 
 # Create application if it does not exist.
@@ -539,14 +576,14 @@ mastodon_base_url = 'https://' + mastodon_instance
 
 if not mastodon_secret_path.exists():
     if Mastodon.create_app(kAPP_NAME, api_base_url = mastodon_base_url, to_file = mastodon_secret_path):
-        print(log_prefix, 'Tootbot app created on instance "' + mastodon_instance + '".')
+        log('tootbot app created on instance "', mastodon_instance, '"')
     else:
-        print(log_prefix, 'Failed to create app on instance "' + mastodon_instance + '".')
+        log('failed to create app on instance "', mastodon_instance, '"')
         sys.exit(1)
 
 
 # Login to Mastodon.
-print(log_prefix, 'Login to Mastodon "' + mastodon_login + '".')
+log('login to Mastodon "' + mastodon_login + '"')
 
 login_secret_path = account_path.joinpath(mastodon_login + '.secret')
 
@@ -560,7 +597,7 @@ try:
         to_file = login_secret_path
     )
 except Exception as e:
-    print(log_prefix, 'Mastodon login failed -', e)
+    log('login to Mastodon failed - ', e)
     sys.exit(1)
 
 
@@ -568,7 +605,7 @@ except Exception as e:
 try:
     res = mastodon_api.set_language('en')
 except Exception as e:
-    print(log_prefix, 'Failed to change Mastodon locale -', e)
+    log('failed to change Mastodon locale - ', e)
 
 # Fecth Mastodon server configuration.
 mastodon_supported_mime_type = [
@@ -617,7 +654,7 @@ try:
     mastodon_max_media_attachments = safe_dict(mastodon_instance_result, 'configuration.statuses.max_media_attachments', mastodon_max_media_attachments)
 
 except Exception as e:
-    print(log_prefix, 'Failed to fetch Mastodon server configuration, use default -', e)
+    log('failed to fetch Mastodon server configuration, use default - ', e)
 
 
 # Remove previous fetched tweets.
@@ -626,7 +663,7 @@ for path in account_path.glob('tweets.*json'):
 
 
 # Fetch tweets.
-print(log_prefix, 'Fetching tweets.')
+log('fetching tweets')
 
 twitter_sjson_path = account_path.joinpath('tweets.sjson')
 twitter_json_path = account_path.joinpath('tweets.json')
@@ -635,7 +672,7 @@ try:
     subprocess.run("twint -u '%s' -tl --full-text --limit 10 --json -o '%s'" % (twitter_account, str(twitter_sjson_path)), shell = True, capture_output = True, check = True)
     subprocess.run("jq -s . '%s' > '%s'" % (str(twitter_sjson_path), str(twitter_json_path)), shell = True, capture_output = True, check = True)
 except Exception as e:
-    print(log_prefix, 'Failed to fetch tweets -', e)
+    log('failed to fetch tweets - ', e)
     sys.exit(1)
 
 
@@ -643,11 +680,12 @@ except Exception as e:
 try:
     tweets = json.load(open(twitter_json_path, 'r'))
 except Exception as e:
-    print(log_prefix, 'Failed to parse tweets -', e)
+    log('failed to parse tweets - ', e)
     sys.exit(1)
 
-print(log_prefix, 'Fetched', len(tweets), 'tweets.')
+log('fetched ', len(tweets), ' tweets')
 
+# Handle tweets.
 for tweet in reversed(tweets):
     tweet_id = safe_int(tweet['id'])
     tweet_conversation_id = safe_int(tweet['conversation_id'])
@@ -658,9 +696,6 @@ for tweet in reversed(tweets):
     toot_photos_ids = []
     toot_videos_ids = []
 
-    # Define log helper.
-    def log_updater(text):
-        print(log_prefix, text.capitalize() + '.')
 
     # Check if this tweet has been processed.
     # > Check.
@@ -671,7 +706,7 @@ for tweet in reversed(tweets):
         if last:
             continue
     except Exception as e:
-        print(log_prefix, 'Cannot check if tweet ' + str(tweet_id) + ' exist in database -', e)
+        log('cannot check if tweet ', tweet_id, ' exist in database - ', e)
         continue
 
     # > Set.
@@ -679,28 +714,25 @@ for tweet in reversed(tweets):
         db.execute("INSERT INTO tweets (tweet_id, tweet_conversation_id, toot_id, twitter_account, mastodon_login, mastodon_instance) VALUES (?, ?, ?, ?, ?, ?)", (tweet_id, tweet_conversation_id, toot_id, twitter_account, mastodon_login, mastodon_instance))
         sql.commit()
 
+
     # Log.
-    print(log_prefix, '--- ' + str(tweet_id))
-    print(log_prefix, 'Content: ' + tweet_content.replace('\n', ' ') + '".')
+    log('--- ', str(tweet_id))
+    log('content: "', tweet_content, '"')
 
-    # Check tweet content size.
-    if len(tweet_content) > mastodon_max_characters:
-        print(log_prefix, 'Tweet skipped (too big - ' + str(len(tweet_content)) + ' > ' + str(mastodon_max_characters) + ').')
-        mark_tweet_as_processed(-1)
-        continue
 
-    # Do not toot twitter replies.
+    # We don't want to toot twitter replies (too much noise).
     if 'reply_to' in tweet and len(tweet['reply_to']) > 0:
-        print(log_prefix, 'Tweet skipped (reply).')
+        log('tweet skipped: it\'s a reply')
         mark_tweet_as_processed(-2)
         continue
+
 
     # Handle bogus RTs. They start with 'RT @username: '.
     bogus_rt_unrecoverable = re.match(r'^RT\s+@[^:]+:\s.*…', tweet_content, flags = re.DOTALL | re.IGNORECASE)
     bogus_rt_recoverable = re.match(r'^(RT\s+@([^:]+):\s).*', tweet_content, flags = re.DOTALL | re.IGNORECASE)
 
     if bogus_rt_unrecoverable is not None:
-        print(log_prefix, 'Tweet skipped (bogus RT).')
+        log('tweet skipped: bogus reweet')
         mark_tweet_as_processed(-3)
         continue
     elif bogus_rt_recoverable is not None:
@@ -712,32 +744,49 @@ for tweet in reversed(tweets):
         tweet_content = tweet_content[:span[0]] + tweet_content[span[1]:]
         
         # > Log.
-        print(log_prefix, 'Bogus RT recovered: "'+ tweet_content.replace('\n', ' ') + '".')
+        log('bogus retweet recovered: "', tweet_content, '"')
+
+
+    # Check basic tweet content size.
+    if len(tweet_content) > mastodon_max_characters:
+        log('tweet skipped - too long ', len(tweet_content), ' > ', mastodon_max_characters)
+        mark_tweet_as_processed(-1)
+        continue
+
 
     # Handle retweet.
     if twitter_account and tweet_username.lower() != twitter_account.lower():
-        tweet_content = ('🔄 @%s@twitter.com\n\n%s' % (tweet_username, tweet_content))
-    
-    # Handle quote tweet. Note: a quote tweet can be retweeted.
+        new_tweet_content = ('🔄 @%s@twitter.com\n\n%s' % (tweet_username, tweet_content))
+
+        if len(new_tweet_content) > mastodon_max_characters:
+            log('retweet skipped - toot too long ', len(new_tweet_content), ' > ', mastodon_max_characters)
+            mark_tweet_as_processed(-4)
+            continue
+        else:
+            tweet_content = new_tweet_content            
+
+
+    # Handle quoted tweet.
+    # Note: a quoted tweet can be retweeted.
     quoted_tweet_images = None
 
     if 'quote_url' in tweet and tweet['quote_url'] != '':
         quote_url = tweet['quote_url']
 
-        print(log_prefix, 'Handle quoted tweet "' + quote_url + '".')
+        log('handle quoted tweet "', quote_url, '"')
 
         try:
-            # Fetch quoted tweet.
+            # > Fetch quoted tweet.
             fetch_result = fetch_tweet(quote_url, account_path)
             quoted_twitter_username = fetch_result[0]
             quoted_tweet = fetch_result[2]
 
-            # Generate quoted content.
+            # > Generate quoted content.
             if quoted_tweet is None or 'tweet' not in quoted_tweet:
-                print(log_prefix, 'Failed to fetch quoted tweet "' + quote_url + '".')
+                log('failed to fetch quoted tweet "', quote_url, '"')
                 quoted_content = ('@%s@twitter.com\n\n%s' % (quoted_twitter_username, quote_url))
             else:
-                quoted_tweet_content_raw =  quoted_tweet['tweet']
+                quoted_tweet_content_raw = quoted_tweet['tweet']
                 quoted_tweet_content = html.unescape(quoted_tweet_content_raw)
 
                 quoted_content = ('@%s@twitter.com\n\n%s' % (quoted_twitter_username, quoted_tweet_content))
@@ -746,21 +795,27 @@ for tweet in reversed(tweets):
                     quoted_tweet_images = quoted_tweet['photos']
 
         except Exception as e:
-            print(log_prefix, 'Invalid quote url "' + quote_url + '" -', e)
+            log('invalid quote url "', quote_url, '" - ', e)
             quoted_content = quote_url
 
-        # Generate tweet content.
+        # > Generate tweet content.
         def create_quote_tweet(content):
             return tweet_content + ('\n\n———\n🔄 %s' % content)
         
         new_tweet_content = create_quote_tweet(quoted_content)
 
         if len(new_tweet_content) > mastodon_max_characters:
-            print(log_prefix, "Toot would be too big with this quote, use reduced format.")
-            tweet_content = create_quote_tweet(quote_url) # It can still be too big: just catch that later.
-        else:
-            tweet_content = new_tweet_content
+            log('toot too long with this quote, use reduced format')
+            new_tweet_content = create_quote_tweet(quote_url)
         
+        if len(new_tweet_content) > mastodon_max_characters:
+            log('toot still too long with reduced format, skip')
+            mark_tweet_as_processed(-5)
+            continue
+
+        tweet_content = new_tweet_content
+        
+
     # Gather all links. Note: '\xa0' is unicode whitespace.
     links = re.findall(r'https?://[^\s\xa0]+', tweet_content)
     
@@ -769,6 +824,7 @@ for tweet in reversed(tweets):
 
     if quoted_tweet_images is not None:
         links = links + quoted_tweet_images
+
 
     # Handle links.
     handled_links = set()
@@ -786,12 +842,12 @@ for tweet in reversed(tweets):
 
         # > Check if we reached limits.
         if len(toot_videos_ids) > mastodon_max_media_attachments or len(toot_videos_ids) + len(toot_photos_ids) > mastodon_max_media_attachments:
-            print(log_prefix, 'Skip link "' + link + '" -> "' + dir_link + '" (limit of ' + str(mastodon_max_media_attachments) + ' medias reached).')
-            tweet_content = tweet_content.replace(link, dir_link)
+            log('skip link "', link, '" -> "', dir_link, '" - limit of ', mastodon_max_media_attachments, ' medias reached')
+            tweet_content = safe_replace(tweet_content, link, dir_link, mastodon_max_characters, log)
             continue
 
         # > Log.
-        print(log_prefix, 'Handle link "' + link + '" -> "' + dir_link + '".')
+        log('handle link "', link, '" -> "', dir_link, '"')
 
         # > Handle '/photo/' and '/video/' link as video.
         # > The gif animations are encoded as video, and stay under the '/photo/' path. If it's a real photo, it will just fail.
@@ -809,17 +865,17 @@ for tweet in reversed(tweets):
                 tweet_content = tweet_content.replace(link, '')
                 tweet_content = tweet_content.replace(dir_link, '')
 
-            # Check that Mastodon server accept video.
+            # Check that Mastodon server accept mp4 video.
             if 'video/mp4' not in mastodon_supported_mime_type:
-                print(log_prefix, 'Skip video "' + dir_link +  '": server doesn\'t support this type.')
+                log('skip video "', dir_link, '": server doesn\'t support this type of video')
                 continue
 
             # Download from Twitter, and upload to Mastodon.
             try:
                 # > Download the video.
-                print(log_prefix, 'Download video "' + dir_link +  '".')
+                log('download video "', dir_link, '"')
 
-                download_video(dir_link, video_path, mastodon_video_size_limit, log_updater)
+                download_video(dir_link, video_path, mastodon_video_size_limit, log)
 
                 # > Read video content.
                 file = open(video_path, "rb")
@@ -831,15 +887,15 @@ for tweet in reversed(tweets):
 
                 # > Check result size.
                 if len(video_data) > mastodon_video_size_limit:
-                    print(log_prefix, 'Skip video (still too big ' + str(len(video_data)) + ' > ' + str(mastodon_video_size_limit) + ').')
+                    log('skip video - too big ', len(video_data), ' > ', mastodon_video_size_limit)
                     continue
 
                 # > Post the video.
-                print(log_prefix, 'Upload video to Mastodon server.')
+                log('upload video to Mastodon server')
 
-                media_id = mastodon_media_post(mastodon_api, video_data, 'video/mp4', log_updater)
+                media_id = mastodon_media_post(mastodon_api, video_data, 'video/mp4', log)
 
-                print(log_prefix, 'Uploaded video (' + str(media_id) + ').')
+                log('uploaded video - media-id: ', media_id)
 
                 # > Store media id.
                 toot_videos_ids.append(media_id)
@@ -853,7 +909,7 @@ for tweet in reversed(tweets):
                 continue
 
             except Exception as e:
-                print(log_prefix, 'Cannot upload video -', e)
+                log('cannot upload video - ', e)
             
         # > Handle 'pbs.twimg.com'
         if 'https://pbs.twimg.com/' in dir_link:
@@ -861,43 +917,46 @@ for tweet in reversed(tweets):
 
             # > Skip video thumbnails. Video are completely attached in previous section.
             if '/tweet_video_thumb/' in dir_link:
-                print(log_prefix, 'Skip thumbnail photo "' + dir_link + '".')
+                log('skip thumbnail photo "', dir_link, '"')
                 continue
 
-            print(log_prefix, 'Download photo "' + dir_link + '".')
+            log('download photo "', dir_link, '"')
 
             # > Try by passing by nitter.
             if media is None:
                 try:
                     media = requests.get(dir_link.replace('https://pbs.twimg.com/', 'https://nitter.net/pic/orig/'))
                 except Exception as e:
-                    print(log_prefix, 'Failed to download the photo via nitter -', e)
+                    log('failed to download the photo via nitter - ', e)
 
             # > Try by using the original link.
             if media is None:
                 try:
                     media = requests.get(dir_link)
                 except Exception as e:
-                    print(log_prefix, 'Failed to download the photo via original url -', e)
+                    log('failed to download the photo via original url - ', e)
 
             # > Post.
             if media is not None:
                 try:
                     # > Check that Mastodon server accept this kind of photo.
-                    if media.headers.get('content-type').lower() not in mastodon_supported_mime_type:
-                        print(log_prefix, 'Skip photo "' + dir_link +  '": server doesn\'t support this type.')
+                    content = media.content
+                    content_type = media.headers.get('content-type')
+
+                    if content_type.lower() not in mastodon_supported_mime_type:
+                        log('skip photo "', dir_link, '": server doesn\'t support ', content_type, ' media')
                         continue
 
                     # > Check the size is okay.
-                    if len(media.content) > mastodon_image_size_limit:
-                        print(log_prefix, 'Skip photo (too big ' + str(len(media.content)) + ' > ' + str(mastodon_image_size_limit) + ').')
+                    if len(content) > mastodon_image_size_limit:
+                        log('skip photo - too big ', len(content), ' > ', mastodon_image_size_limit)
 
                     # > Post the photo.
-                    print(log_prefix, 'Upload photo to Mastodon server.')
+                    log('upload photo to Mastodon server')
 
-                    media_id = mastodon_media_post(mastodon_api, media.content, media.headers.get('content-type'), log_updater)
+                    media_id = mastodon_media_post(mastodon_api, content, content_type, log)
 
-                    print(log_prefix, 'Uploaded photo (' + str(media_id) + ').')
+                    log('uploaded photo - media-id: ', media_id)
 
                     # > Store media id.
                     toot_photos_ids.append(media_id)
@@ -910,18 +969,21 @@ for tweet in reversed(tweets):
                     continue
 
                 except Exception as e:
-                    print(log_prefix, 'Cannot upload photo -', e)
+                    log('cannot upload photo - ', e)
 
         # > Fallback: Handle other links.
-        tweet_content = tweet_content.replace(link, dir_link)
+        tweet_content = safe_replace(tweet_content, link, dir_link, mastodon_max_characters, log)
+
 
     # Remove ellipsis
     #tweet_content = tweet_content.replace('\xa0…', ' ')
 
     #c = c.replace('  ', '\n').replace('. ', '.\n')
 
+
     # Replace links to twitter by nitter ones.
-    tweet_content = tweet_content.replace('/twitter.com/', '/nitter.net/')
+    tweet_content = safe_replace(tweet_content, '/twitter.com/', '/nitter.net/', mastodon_max_characters, log)
+
 
     # Replace Twitter handles by Mastodon style handle:
     # - Avoid Twitter handles which may reference unrelated Mastodon users.
@@ -931,8 +993,10 @@ for tweet in reversed(tweets):
     #  handles (if someone Tweet a Mastodon handle for example), so we need to match
     #  a 'separator' caracter before and after Twitter handle, but doing so
     #  will make re.sub to don't see 2 handles separated by this separator (a space, for example).
+    new_tweet_content = tweet_content
+
     while True:
-        match = re.search(r'(^|[^a-zA-Z0-9_@])(@[a-zA-Z0-9_]{1,15})($|[^a-zA-Z0-9_@])', tweet_content)
+        match = re.search(r'(^|[^a-zA-Z0-9_@])(@[a-zA-Z0-9_]{1,15})($|[^a-zA-Z0-9_@])', new_tweet_content)
 
         if match is None:
             break
@@ -941,15 +1005,39 @@ for tweet in reversed(tweets):
         span2 = match.span(3) # Second 'separator' group.
 
         #               ... (^|[...])]           + Twitter handle + @twitter.com   + [($|[...]) ...
-        tweet_content = tweet_content[:span1[1]] + match.group(2) + '@twitter.com' + tweet_content[span2[0]:]
+        new_tweet_content = new_tweet_content[:span1[1]] + match.group(2) + '@twitter.com' + new_tweet_content[span2[0]:]
+    
+    if len(new_tweet_content) > mastodon_max_characters:
+        log('replaced handles are too long, use original handles')
+    else:
+        tweet_content = new_tweet_content
+
 
     # Replace utm_? tracking.
-    tweet_content = re.sub('\?utm.*$', '?utm_medium=Social&utm_source=Mastodon', tweet_content)
+    new_tweet_content = re.sub('\?utm.*$', '?utm_medium=Social&utm_source=Mastodon', tweet_content)
+
+    if len(new_tweet_content) > mastodon_max_characters:
+        log('replaced utm tracking is too long, use original utm')
+    else:
+        tweet_content = new_tweet_content
+
 
     # Add footer tags.
     if footer_tags:
-        tweet_content = tweet_content + '\n' + footer_tags
+        new_tweet_content = tweet_content + '\n' + footer_tags
+
+        if len(new_tweet_content) > mastodon_max_characters:
+            log('footer tags are too long, skip them')
+        else:
+            tweet_content = new_tweet_content
+
     
+    # Check size.
+    if len(tweet_content) > mastodon_max_characters:
+        log('truncate toot, too long - ', len(tweet_content), ' > ', mastodon_max_characters)
+        tweet_content = tweet_content[:mastodon_max_characters]
+
+
     # Check if this tweet is part of a conversation.
     toot_reply_to_id = None
 
@@ -965,31 +1053,29 @@ for tweet in reversed(tweets):
                     toot_reply_to_id = last_tweet_id
        
         except Exception as e:
-            print(log_prefix, 'Cannot check if tweet ' +  str(tweet_id) + ' is part of a conversation -', e)
+            log('cannot check if tweet ', tweet_id, ' is part of a conversation - ', e)
 
-    # Check size.
-    if len(tweet_content) > mastodon_max_characters:
-        print(log_prefix, 'Toot too big. Truncate.')
-        tweet_content = tweet_content[:mastodon_max_characters]
 
     # Post.
     if toot_reply_to_id is None:
-        print(log_prefix, 'Posting toot.')
+        log('posting toot')
     else:
-        print(log_prefix, 'Posting toot as reply of toot ' + str(toot_reply_to_id) + ' (twitter conversation ' + str(tweet_conversation_id) + ').')
+        log('posting toot as reply of toot ', toot_reply_to_id, ' - twitter conversation ',  tweet_conversation_id)
 
     try:
         # > Post the toot.
-        toot = mastodon_post(mastodon_api, tweet_content, toot_reply_to_id, toot_photos_ids, toot_videos_ids, log_updater)
+        toot = mastodon_post(mastodon_api, tweet_content, toot_reply_to_id, toot_photos_ids, toot_videos_ids, log)
         toot_id = safe_int(toot["id"])
 
         # > Mark as processed.
         mark_tweet_as_processed(toot_id)
         
         # > Log post.
-        print(log_prefix, 'Tweet ' + str(tweet_id) + ' created at ' + str(tweet['created_at']) + ' has been posted on ' + mastodon_instance + ' (' + str(toot_id) + ').')
+        log('tweet ', tweet_id, ' created at ', tweet['created_at'], ' has been posted on ', mastodon_instance, ' - toot-id:', toot_id)
 
     except Exception as e:
-        print(log_prefix, e, '- skip tweet.')
+        log('can\'t post toot - ', e)
 
-print(log_prefix, 'Done.')
+# Done.
+log('done')
+print('')
