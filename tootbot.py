@@ -971,7 +971,6 @@ for tweet in reversed(tweets):
     if len(tweet_content) > mastodon_max_characters:
         print(log_prefix, 'Toot too big. Truncate.')
         tweet_content = tweet_content[:mastodon_max_characters]
-        continue
 
     # Post.
     if toot_reply_to_id is None:
