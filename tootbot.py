@@ -479,7 +479,7 @@ else:
 log_prefix = twitter_account + ':'
 
 def log(*args):
-    result = stringify(*args).capitalize()
+    result = stringify(*args)
 
     if len(result) > 0:
         result = result[:1].upper() + result[1:]
