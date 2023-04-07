@@ -50,27 +50,41 @@ kAPP_NAME = 'tootbot'
 # Helpers
 
 # Resolve redirected links.
+# Note: if 'https' time-out, we retry with 'http'. It's unsafe, and in ideal it shouldn't be necessary,
+#   but there is a combination of issues for some redirect links which force us to do it:
+#     - Redirection like 't.co' may give an invalid https 301 / 'Location' (it doesn't generate this 301 / 'Location' response
+#           when the 'User-Agent' looks like a browser: instead, an HTML page is generated which redirect to the actual proper URL).
+#     - Redirection like 'u.afp.com' doesn't answer at all if accessed via 'https' / 443. They work only on 'http' / 80 (??!!).
+#   So we have to try 'http'.
+
+#   An alternative solution would be to do the same as browsers:
+#     - Pass a browser-like 'User-Agent'.
+#     - Use a 'GET' request instead of 'HEAD'.
+#     - Parse the resulting HTML content, and try to catch things like 'http-equiv="refresh"', 'location' JavaScript, etc.
+#   It's probably too much for what we want to achieve here, so we stay on an imperfect solution.
 def unredir(redir):
-
-    redir_count = 0
-
-    while True:
+    for redir_nbr in range(10):
         try:
-            r = requests.head(redir, allow_redirects = False, timeout = 15)
+            r = requests.head(redir, allow_redirects = False, timeout = 5)
             
             status_code = r.status_code
             location = r.headers.get('Location')
                 
-        except:
+        except (requests.exceptions.ConnectTimeout, requests.exceptions.ReadTimeout) as e:
+            redirs = urlsplit(redir)
+            redir_scheme = redirs[0]
+
+            if redir_scheme.lower() == 'https':
+                redir = urlunsplit(('http', redirs[1], redirs[2], redirs[3], redirs[4]))
+                continue
+            
+            return redir
+        
+        except Exception as e:
             return redir
 
         if status_code not in { 301, 302 }:
-            break
-        
-        redir_count = redir_count + 1
-
-        if redir_count > 10:
-            break
+            return redir
 
         if 'http' not in location:
             redir = re.sub(r'(https?://.*)/.*', r'\1', redir) + location
