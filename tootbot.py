@@ -305,7 +305,7 @@ def fetch_tweet(tweet_url, tmp_dir_path = Path('/tmp/')):
         if attempt == 0:
             try:
                 subprocess.run("twint -u '%s' -s 'since_id:%s and max_id:%s' --full-text --limit 1 --json -o '%s'" %
-                                (twitter_username, str(tweet_id - 1), str(tweet_id), str(tmp_sjson_path)), shell = True, capture_output = True, check = True)
+                                (twitter_username, str(tweet_id - 1), str(tweet_id), str(tmp_sjson_path)), shell = True, capture_output = True, check = True, timeout = 15)
 
                 subprocess.run("jq -s . '%s' > '%s'" % (str(tmp_sjson_path), str(tmp_json_path)), shell = True, capture_output = True, check = True)
                 
@@ -319,7 +319,7 @@ def fetch_tweet(tweet_url, tmp_dir_path = Path('/tmp/')):
         elif attempt == 1:
             try:
                 subprocess.run("twint -u '%s' -s 'max_id:%s' --full-text --limit 20 --json -o '%s'" %
-                                (twitter_username, str(tweet_id), str(tmp_sjson_path)), shell = True, capture_output = True, check = True)
+                                (twitter_username, str(tweet_id), str(tmp_sjson_path)), shell = True, capture_output = True, check = True, timeout = 15)
 
                 subprocess.run("jq -s . '%s' > '%s'" % (str(tmp_sjson_path), str(tmp_json_path)), shell = True, capture_output = True, check = True)
                 
@@ -373,7 +373,7 @@ def download_video(video_url, video_path, max_video_size, logger = None):
 
     try:
         subprocess.run("yt-dlp -o '%s' -N 8 -f b -S 'filesize~%sM' --recode-video mp4 --no-playlist --max-filesize 500M '%s'" %
-                        (str(video_path), str(max_video_size_mib), video_url), shell = True, capture_output = False, check = True)
+                        (str(video_path), str(max_video_size_mib), video_url), shell = True, capture_output = False, check = True, timeout = 300)
     except Exception as e:
         unlink_noerr(video_path)
         raise
@@ -669,7 +669,7 @@ twitter_sjson_path = account_path.joinpath('tweets.sjson')
 twitter_json_path = account_path.joinpath('tweets.json')
 
 try:
-    subprocess.run("twint -u '%s' -tl --full-text --limit 10 --json -o '%s'" % (twitter_account, str(twitter_sjson_path)), shell = True, capture_output = True, check = True)
+    subprocess.run("twint -u '%s' -tl --full-text --limit 10 --json -o '%s'" % (twitter_account, str(twitter_sjson_path)), shell = True, capture_output = True, check = True, timeout = 60)
     subprocess.run("jq -s . '%s' > '%s'" % (str(twitter_sjson_path), str(twitter_json_path)), shell = True, capture_output = True, check = True)
 except Exception as e:
     log('failed to fetch tweets - ', e)
@@ -684,6 +684,7 @@ except Exception as e:
     sys.exit(1)
 
 log('fetched ', len(tweets), ' tweets')
+
 
 # Handle tweets.
 for tweet in reversed(tweets):
@@ -721,7 +722,8 @@ for tweet in reversed(tweets):
 
 
     # We don't want to toot twitter replies (too much noise).
-    if 'reply_to' in tweet and len(tweet['reply_to']) > 0:
+    # Note: some reply-to are badly detected by Twint, so we also match tweet starting with a twitter handle.
+    if ('reply_to' in tweet and len(tweet['reply_to']) > 0) or re.match(r'^@[a-zA-Z0-9_]{1,15}($|[^a-zA-Z0-9_@])', tweet_content) != None:
         log('tweet skipped: it\'s a reply')
         mark_tweet_as_processed(-2)
         continue
