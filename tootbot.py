@@ -255,6 +255,19 @@ def mastodon_post(mastodon_api, tweet_content, in_reply_to_id, photos_ids, video
             elif '422' in description and 'Unprocessable Entity'.lower() in description and 'text character limit of'.lower() in description:
                 llogger('toot is to big')
                 return { 'id' : -2 } # This error will never solve, we don't want to retry forever: give an invalid toot_id to consider it as processed.
+            
+            elif '422' in description and 'Text can\'t be blank'.lower() in description:
+
+                if len(medias_ids) == 0:
+                    raise Exception('Unexpected blank toot without medias')
+
+                if try_count >= 2:
+                    raise Exception('Unexpected blank toot')
+                else:
+                    llogger('tweet is blank, will retry in 1 second by using a space - ', e)
+
+                    tweet_content = ' '
+                    time.sleep(1)
 
             elif '404' in description and 'the post you are trying to reply'.lower() in description:
                 if try_count >= 2:
@@ -921,25 +934,27 @@ for tweet in reversed(tweets):
             if '/tweet_video_thumb/' in dir_link:
                 log('skip thumbnail photo "', dir_link, '"')
                 continue
-
-            log('download photo "', dir_link, '"')
-
+            
             # > Try by passing by nitter.
-            if media is None:
+            if media is None or media.ok == False:
+                log('try to download photo "', dir_link, '" via nitter')
+
                 try:
                     media = requests.get(dir_link.replace('https://pbs.twimg.com/', 'https://nitter.net/pic/orig/'))
                 except Exception as e:
                     log('failed to download the photo via nitter - ', e)
 
             # > Try by using the original link.
-            if media is None:
+            if media is None or media.ok == False:
+                log('try to download photo "', dir_link, '" directly')
+
                 try:
                     media = requests.get(dir_link)
                 except Exception as e:
                     log('failed to download the photo via original url - ', e)
 
             # > Post.
-            if media is not None:
+            if media is not None and media.ok:
                 try:
                     # > Check that Mastodon server accept this kind of photo.
                     content = media.content
@@ -1076,7 +1091,11 @@ for tweet in reversed(tweets):
         log('tweet ', tweet_id, ' created at ', tweet['created_at'], ' has been posted on ', mastodon_instance, ' - toot-id:', toot_id)
 
     except Exception as e:
+        # > Log the error.
         log('can\'t post toot - ', e)
+
+        # > Mark as processed.
+        mark_tweet_as_processed(-6)
 
 # Done.
 log('done')
